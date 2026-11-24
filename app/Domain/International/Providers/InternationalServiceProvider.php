@@ -15,13 +15,9 @@ use RuntimeException;
 /**
  * Bindings for the International domain's provider seams.
  *
- * NOT registered yet: add
- *   App\Domain\International\Providers\InternationalServiceProvider::class,
- * to bootstrap/providers.php to activate it. Everything in this domain
- * already defaults to these fail-closed implementations internally, so
- * registration changes nothing today — it exists so a future real
- * provider (rail gateway, sanctions screener, FX feed) has exactly one
- * place to replace a binding.
+ * Registered in bootstrap/providers.php. The default bindings remain
+ * fail-closed until a real, approved provider is configured. This is the
+ * single integration point for a future rail gateway or screening adapter.
  *
  * - InternationalRailGatewayInterface → DisabledInternationalRailGateway
  *   (refuses every dispatch; no provider is connected).
