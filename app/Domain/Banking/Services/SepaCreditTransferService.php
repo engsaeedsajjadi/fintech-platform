@@ -26,6 +26,12 @@ class SepaCreditTransferService
     /**
      * Initiate a SEPA Credit Transfer or Instant Credit Transfer.
      *
+     * This builds the ISO 20022 message (Pain.001 / Pacs.008) and returns
+     * it with status 'pending'. It does NOT transmit anything: there is
+     * no live SEPA endpoint, so `transmitted` is always false and the
+     * transfer must be submitted to a bank/PSP by an operator or a
+     * future live adapter. Never treat the returned message as money sent.
+     *
      * @return array{
      *   transfer_id: string,
      *   type: string,
@@ -36,6 +42,7 @@ class SepaCreditTransferService
      *   currency: string,
      *   reference: string,
      *   instant: bool,
+     *   transmitted: bool,
      *   iso20022_message: array<string, mixed>,
      *   iso20022_xml: string,
      *   created_at: string,
@@ -79,6 +86,7 @@ class SepaCreditTransferService
             'currency'             => $currency,
             'reference'            => $endToEndId,
             'instant'              => $instant,
+            'transmitted'          => false,
             'iso20022_message'     => $messageArr,
             'iso20022_xml'         => $messageXml,
             'created_at'           => $now->format('Y-m-d\TH:i:s\Z'),

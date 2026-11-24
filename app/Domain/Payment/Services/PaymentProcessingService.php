@@ -11,6 +11,7 @@ use App\Domain\Payment\Exceptions\PaymentCancellationException;
 use App\Domain\Payment\Exceptions\PaymentNotFoundException;
 use App\Domain\Payment\Exceptions\PaymentProcessingException;
 use App\Domain\Payment\Exceptions\RefundNotAllowedException;
+use App\Domain\Payment\Models\PaymentIntent;
 use App\Domain\Shared\Contracts\AccountOperationsInterface;
 use App\Domain\Shared\Contracts\PaymentProcessingInterface;
 use App\Domain\Shared\Logging\AuditLogger;
@@ -39,8 +40,14 @@ class PaymentProcessingService implements PaymentProcessingInterface
 
     public function __construct(
         private readonly PaymentServiceInterface $paymentService,
-        private readonly AccountOperationsInterface $accountOperations
+        private readonly AccountOperationsInterface $accountOperations,
+        private readonly ?PaymentIntentService $intents = null,
     ) {
+    }
+
+    private function intentService(): PaymentIntentService
+    {
+        return $this->intents ?? app(PaymentIntentService::class);
     }
 
     /**
@@ -96,8 +103,13 @@ class PaymentProcessingService implements PaymentProcessingInterface
             };
 
             $payment = [
-                'payment_id'         => $paymentId,
-                'status'             => 'completed',
+                'payment_id' => $paymentId,
+                // PROCESSING, not completed: merely starting the provider
+                // workflow is not provider confirmation. The final state
+                // comes from the webhook / status query / reconciliation
+                // on the intent whose id is returned here.
+                'status'             => 'processing',
+                'intent_id'          => $externalReference,
                 'external_reference' => $externalReference,
                 'amount'             => $amount,
                 'currency'           => $currency,
@@ -291,33 +303,56 @@ class PaymentProcessingService implements PaymentProcessingInterface
             throw new RefundNotAllowedException($paymentId, 'Only deposits can be refunded');
         }
 
-        if ($payment['status'] !== 'completed') {
-            $this->auditOperationFailure('payment_refund', 'Payment not completed', [
-                'payment_id'     => $paymentId,
-                'payment_status' => $payment['status'],
+        // A refund is a real provider-side movement, recorded as its own
+        // intent — never a cache-local status flip. The original deposit
+        // must have a recorded intent that the provider confirmed
+        // (SUCCESSFUL); a merely-started ('processing') deposit cannot be
+        // refunded, and a payment with no intent at all fails closed.
+        $intentId = $payment['intent_id'] ?? null;
+        $intent = is_string($intentId) ? PaymentIntent::query()->find($intentId) : null;
+        if (! $intent instanceof PaymentIntent) {
+            $this->auditOperationFailure('payment_refund', 'Payment has no recorded intent', [
+                'payment_id' => $paymentId,
             ]);
-            throw new RefundNotAllowedException($paymentId, 'Payment must be completed to refund');
+            throw new RefundNotAllowedException($paymentId, 'Payment has no recorded provider intent; a refund requires a settled intent.');
         }
 
         $refundAmount = $amount ?? $payment['amount'];
-        $refundId = (string) Str::uuid();
+
+        try {
+            $refundIntent = $this->intentService()->refund(
+                $intent,
+                (int) $refundAmount,
+                'refund:' . $paymentId . ':' . (int) $refundAmount,
+            );
+        } catch (InvalidArgumentException $e) {
+            $this->auditOperationFailure('payment_refund', $e->getMessage(), [
+                'payment_id' => $paymentId,
+            ]);
+            throw new RefundNotAllowedException($paymentId, $e->getMessage(), previous: $e);
+        }
 
         $refund = [
-            'refund_id'  => $refundId,
+            'refund_id'  => $refundIntent->id,
             'payment_id' => $paymentId,
-            'status'     => 'completed',
+            'intent_id'  => $refundIntent->id,
+            // PROCESSING: the refund intent was created; the provider has
+            // not confirmed it yet.
+            'status'     => 'processing',
             'amount'     => $refundAmount,
             'currency'   => $payment['currency'],
             'created_at' => now()->toIso8601String(),
         ];
 
-        // Update original payment
-        $payment['status'] = $refundAmount >= $payment['amount'] ? 'refunded' : 'partially_refunded';
+        // Record the refund intent on the cached payment; the original
+        // deposit's settled status is NOT rewritten — the refund is a
+        // separate intent whose outcome arrives from the provider.
+        $payment['refund_intent_id'] = $refundIntent->id;
         $payment['updated_at'] = now()->toIso8601String();
         Cache::put(self::PAYMENT_PREFIX . $paymentId, encrypt($payment), self::PAYMENT_TTL);
 
         $this->auditOperationSuccess('payment_refund', [
-            'refund_id'     => $refundId,
+            'refund_id'     => $refundIntent->id,
             'payment_id'    => $paymentId,
             'refund_amount' => $refundAmount,
         ]);

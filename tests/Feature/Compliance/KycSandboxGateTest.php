@@ -144,10 +144,11 @@ describe('simulated providers are labelled sandbox and never verified', function
             ->and($result['status'])->toBe('requires_manual_review');
     });
 
-    it('face match keeps its simulated score but is labelled sandbox, not verified', function () {
+    it('face match never passes, even in the sandbox', function () {
         $result = $this->biometric->matchFaces('a.jpg', 'b.jpg');
 
-        expect($result['similarity'])->toBe(92.5)
+        expect($result['similarity'])->toBeNull()
+            ->and($result['is_match'])->toBeFalse()
             ->and($result['sandbox'])->toBeTrue()
             ->and($result['verified'])->toBeFalse();
     });

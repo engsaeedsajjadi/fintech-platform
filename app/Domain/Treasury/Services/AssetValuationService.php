@@ -297,6 +297,15 @@ class AssetValuationService
 
     private function fetchAssetPrices(array $assetIds): array
     {
+        // SANDBOX FIXTURE ONLY: hardcoded prices with random jitter.
+        // There is no market-data provider wired behind this service, so
+        // outside the sandbox it must refuse instead of returning
+        // invented prices labelled as market data (the old code labelled
+        // them 'market_data' in every non-demo environment).
+        if (! $this->sandboxPricesEnabled()) {
+            throw new RuntimeException('Treasury valuation has no market-data provider configured; sandbox prices are disabled (treasury.sandbox_prices_enabled). Refusing to value assets at invented prices.');
+        }
+
         // In production, this would call external financial data APIs
         // For development/demo, we'll use mock data with slight variations
 
@@ -318,11 +327,18 @@ class AssetValuationService
                 'change_percent' => round($variation * 100, 2),
                 'volume'         => rand(100000, 1000000),
                 'last_updated'   => now()->toISOString(),
-                'source'         => config('app.env') === 'demo' ? 'mock_data' : 'market_data',
+                'source'         => 'sandbox_mock',
+                'sandbox'        => true,
             ];
         }
 
         return $prices;
+    }
+
+    /** Whether the hardcoded sandbox price tables may be consulted. */
+    private function sandboxPricesEnabled(): bool
+    {
+        return (bool) config('treasury.sandbox_prices_enabled', false);
     }
 
     private function getDefaultAssetPrice(string $assetId): float
@@ -341,6 +357,12 @@ class AssetValuationService
 
     private function generateMockHistoricalData(array $assetIds, \Carbon\Carbon $startDate, \Carbon\Carbon $endDate): array
     {
+        // Same sandbox gate as fetchAssetPrices: invented history must
+        // never feed a real correlation / volatility calculation.
+        if (! $this->sandboxPricesEnabled()) {
+            throw new RuntimeException('Treasury valuation has no market-data provider configured; sandbox prices are disabled (treasury.sandbox_prices_enabled). Refusing to value assets at invented prices.');
+        }
+
         $historicalData = [];
         $currentDate = $startDate->copy();
 

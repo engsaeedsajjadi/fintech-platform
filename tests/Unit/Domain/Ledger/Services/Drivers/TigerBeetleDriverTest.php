@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use App\Domain\Ledger\Contracts\LedgerDriverInterface;
+use App\Domain\Ledger\Exceptions\LedgerUnavailableException;
 use App\Domain\Ledger\Services\Drivers\TigerBeetleDriver;
 
 uses(Tests\TestCase::class);
@@ -21,26 +22,24 @@ it('has all required interface methods', function (): void {
     expect($reflection->hasMethod('accountHistory'))->toBeTrue();
 });
 
-it('returns zero balance when TigerBeetle is unreachable', function (): void {
+it('fails closed instead of returning a fabricated zero balance when TigerBeetle is unreachable', function (): void {
     config(['ledger.tigerbeetle.addresses' => '127.0.0.1:19999']);
     $driver = new TigerBeetleDriver();
 
-    $balance = $driver->balance('1100');
-    expect($balance)->toHaveKeys(['amount', 'currency']);
-    expect($balance['amount'])->toBe('0.0000');
+    expect(fn () => $driver->balance('1100'))->toThrow(LedgerUnavailableException::class);
 });
 
-it('returns empty trial balance', function (): void {
+it('serves the trial balance from the DB journal instead of an empty report', function (): void {
     $driver = new TigerBeetleDriver();
     $result = $driver->trialBalance();
     expect($result)->toBeArray();
     expect($result)->toBeEmpty();
 });
 
-it('returns empty collection for unreachable account history', function (): void {
+it('fails closed instead of returning an empty history when TigerBeetle is unreachable', function (): void {
     config(['ledger.tigerbeetle.addresses' => '127.0.0.1:19999']);
     $driver = new TigerBeetleDriver();
 
-    $history = $driver->accountHistory('1100', now()->subDays(7), now());
-    expect($history)->toBeEmpty();
+    expect(fn () => $driver->accountHistory('1100', now()->subDays(7), now()))
+        ->toThrow(LedgerUnavailableException::class);
 });

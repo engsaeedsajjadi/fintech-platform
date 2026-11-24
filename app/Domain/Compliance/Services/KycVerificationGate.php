@@ -73,6 +73,7 @@ final class KycVerificationGate
             'ondato' => filled(config('services.ondato.application_id'))
                 && filled(config('services.ondato.kyc_api_url')),
             'bridge'              => filled(config('kyc.providers.bridge.api_key')),
+            'iranian'             => false, // No Iranian provider is contracted; sandbox only.
             'sandbox', 'none', '' => false,
             default               => false,
         };

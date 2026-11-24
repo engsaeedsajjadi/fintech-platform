@@ -45,9 +45,11 @@ class JitFundingService
     private const DEFAULT_FUNDING_TOKEN = 'USDC';
 
     /**
-     * Balance assumed for every cardholder in demo mode.
+     * Balance assumed for every cardholder in demo mode, in integer
+     * minor units (1000.00). The authorization decision compares
+     * integer cents, never floats.
      */
-    private const DEMO_BALANCE = 1000.00;
+    private const DEMO_BALANCE_CENTS = 100000;
 
     public function __construct(
         private readonly CardIssuerInterface $cardIssuer,
@@ -117,26 +119,34 @@ class JitFundingService
         //    inside (holds and spend totals live in the cache).
         $userId = (string) ($card->metadata['user_id'] ?? '');
         $requiredAmount = (float) $request->getAmountDecimal();
+        // Integer minor units for every DECISION (balance + spend limit).
+        // The float above survives only for the event payloads, whose
+        // shape is fixed; no decision ever reads it.
+        $requiredCents = (int) bcmul(
+            \App\Support\DecimalString::fromNumeric($request->getAmountDecimal(), 4) ?? '0.0000',
+            '100',
+            0,
+        );
 
         $declineReason = null;
         $holdId = '';
 
-        DB::connection((new Account())->getConnectionName())->transaction(function () use ($request, $userId, $requiredAmount, &$declineReason, &$holdId): void {
+        DB::connection((new Account())->getConnectionName())->transaction(function () use ($request, $userId, $requiredCents, &$declineReason, &$holdId): void {
             if ($this->isDemoMode()) {
                 // Demo issuer: no real account rows, fixed balance.
-                if (self::DEMO_BALANCE < $requiredAmount) {
+                if (self::DEMO_BALANCE_CENTS < $requiredCents) {
                     $declineReason = AuthorizationDecision::DECLINED_INSUFFICIENT_FUNDS;
 
                     return;
                 }
 
-                if (! $this->spendLimitService->checkLimit($request->cardToken, $requiredAmount)) {
+                if (! $this->spendLimitService->checkLimitCents($request->cardToken, $requiredCents)) {
                     $declineReason = AuthorizationDecision::DECLINED_LIMIT_EXCEEDED;
 
                     return;
                 }
 
-                $this->spendLimitService->recordSpend($request->cardToken, $requiredAmount);
+                $this->spendLimitService->recordSpendCents($request->cardToken, $requiredCents);
                 $holdId = 'hold_' . bin2hex(random_bytes(16));
 
                 return;
@@ -165,7 +175,7 @@ class JitFundingService
             }
 
             // Check spend limits inside the lock to prevent limit bypass
-            if (! $this->spendLimitService->checkLimit($request->cardToken, $requiredAmount)) {
+            if (! $this->spendLimitService->checkLimitCents($request->cardToken, $requiredCents)) {
                 $declineReason = AuthorizationDecision::DECLINED_LIMIT_EXCEEDED;
 
                 return;
@@ -189,7 +199,7 @@ class JitFundingService
             // Record the spend while the lock is still held, so a concurrent
             // authorization on the same card cannot pass checkLimit() against
             // the total from before this one.
-            $this->spendLimitService->recordSpend($request->cardToken, $requiredAmount);
+            $this->spendLimitService->recordSpendCents($request->cardToken, $requiredCents);
 
             $holdId = $hold;
         });

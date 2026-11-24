@@ -50,7 +50,7 @@ return [
     // Host working hours (24h) used by the availability endpoint.
     'working_hours' => [
         'start' => env('MEETING_WORKING_HOURS_START', '09:00'),
-        'end' => env('MEETING_WORKING_HOURS_END', '17:00'),
+        'end'   => env('MEETING_WORKING_HOURS_END', '17:00'),
     ],
 
     // Slot length in minutes for availability.
@@ -71,4 +71,8 @@ return [
 
     // Send a reminder this many minutes before the meeting starts.
     'reminder_minutes_before' => (int) env('MEETING_REMINDER_MINUTES_BEFORE', 60),
+
+    // How long a reservation waits for another in-progress reservation
+    // for the same host/participant before failing as a conflict.
+    'lock_timeout_seconds' => (float) env('MEETING_LOCK_TIMEOUT_SECONDS', 10),
 ];

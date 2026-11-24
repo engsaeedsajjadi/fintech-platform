@@ -77,7 +77,7 @@ it('ignores expired exchange rates', function () {
     // If a new rate was fetched, it should be valid
     if ($rate) {
         expect($rate->isValid())->toBeTrue();
-        expect($rate->source)->toBeIn(['api', 'oracle', 'mock', 'test']);
+        expect($rate->source)->toBeIn(['api', 'oracle', 'mock', 'test', 'sandbox_mock']);
     } else {
         expect($rate)->toBeNull();
     }
@@ -257,7 +257,7 @@ it('handles crypto asset rate fetching', function () {
         expect($rate->from_asset_code)->toBe('BTC');
         expect($rate->to_asset_code)->toBe('USD');
         expect($rate->rate)->toBeString();
-        expect($rate->source)->toBe('api');
+        expect($rate->source)->toBe('sandbox_mock');
     } else {
         // The mock might not have BTC-USD pair, so rate could be null
         expect($rate)->toBeNull();
@@ -274,7 +274,7 @@ it('handles fiat currency rate fetching', function () {
         expect($rate->from_asset_code)->toBe('USD');
         expect($rate->to_asset_code)->toBe('EUR');
         expect($rate->rate)->toBeString();
-        expect($rate->source)->toBe('api');
+        expect($rate->source)->toBe('sandbox_mock');
     } else {
         // The mock should have USD-EUR pair
         expect($rate)->toBeNull();

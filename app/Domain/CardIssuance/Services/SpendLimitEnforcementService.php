@@ -23,11 +23,24 @@ class SpendLimitEnforcementService
     /**
      * Check if a spend amount is within the card's configured limit.
      *
+     * The amount is accepted as an exact decimal string (preferred),
+     * an int in minor units via {@see checkLimitCents()}, or — for
+     * legacy callers — a float that is converted with bcmath immediately.
+     * The comparison itself always runs in integer minor units.
+     *
      * @param  string $cardToken The issuer card token
-     * @param  float  $amount    The transaction amount in decimal (e.g. 25.50)
+     * @param  string|float|int $amount The transaction amount in decimal (e.g. '25.50')
      * @return bool   True if the spend is allowed, false if it exceeds the limit
      */
-    public function checkLimit(string $cardToken, float $amount): bool
+    public function checkLimit(string $cardToken, string|float|int $amount): bool
+    {
+        return $this->checkLimitCents($cardToken, $this->toCents($amount));
+    }
+
+    /**
+     * Check a spend in integer minor units — the canonical form.
+     */
+    public function checkLimitCents(string $cardToken, int $amountCents): bool
     {
         $card = $this->resolveCard($cardToken);
 
@@ -37,7 +50,6 @@ class SpendLimitEnforcementService
 
         $interval = $card->spend_limit_interval ?? 'daily';
         $limitCents = $card->spend_limit_cents;
-        $amountCents = (int) round($amount * 100);
 
         $cacheKey = $this->buildCacheKey($cardToken, $interval);
 
@@ -65,9 +77,17 @@ class SpendLimitEnforcementService
      * Uses atomic cache operations to prevent race conditions under concurrent requests.
      *
      * @param string $cardToken The issuer card token
-     * @param float  $amount    The transaction amount in decimal (e.g. 25.50)
+     * @param string|float|int $amount The transaction amount in decimal (e.g. '25.50')
      */
-    public function recordSpend(string $cardToken, float $amount): void
+    public function recordSpend(string $cardToken, string|float|int $amount): void
+    {
+        $this->recordSpendCents($cardToken, $this->toCents($amount));
+    }
+
+    /**
+     * Record a successful spend in integer minor units — the canonical form.
+     */
+    public function recordSpendCents(string $cardToken, int $amountCents): void
     {
         $card = $this->resolveCard($cardToken);
 
@@ -76,7 +96,6 @@ class SpendLimitEnforcementService
         }
 
         $interval = $card->spend_limit_interval ?? 'daily';
-        $amountCents = (int) round($amount * 100);
 
         $cacheKey = $this->buildCacheKey($cardToken, $interval);
         $ttl = $this->getTtl($interval);
@@ -90,6 +109,23 @@ class SpendLimitEnforcementService
             'interval'     => $interval,
             'amount_cents' => $amountCents,
         ]);
+    }
+
+    /**
+     * Convert a decimal amount to integer minor units, exactly.
+     * (int) round((float) $amount * 100) loses cents: 19.99 * 100 is
+     * 1998.999... in binary, which rounds to 1998 or 1999 depending on
+     * the platform. bcmath keeps it exact.
+     */
+    private function toCents(string|float|int $amount): int
+    {
+        if (is_int($amount)) {
+            return $amount;
+        }
+
+        $decimal = \App\Support\DecimalString::fromNumeric($amount, 4) ?? '0.0000';
+
+        return (int) bcmul($decimal, '100', 0);
     }
 
     /**

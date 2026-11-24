@@ -5,7 +5,7 @@
         </h2>
     </x-slot>
 
-    <div @if(app()->getLocale() === 'fa') dir="rtl" lang="fa" @endif class="py-12">
+    <div class="py-12">
         <div class="max-w-7xl mx-auto sm:px-6 lg:px-8 space-y-6">
             <div id="meetings-loading" class="bg-white dark:bg-gray-800 overflow-hidden shadow-sm sm:rounded-lg p-6 text-gray-500">
                 {{ __('meeting.loading') }}
@@ -26,8 +26,7 @@
                                             {{ $meeting->title }}
                                         </a>
                                         <p class="text-sm text-gray-500 dark:text-gray-400">
-                                            {{ \App\Domain\Meeting\Support\JalaliDateHelper::format($meeting->starts_at) }}
-                                            <span class="text-gray-400">({{ $meeting->starts_at->format('Y-m-d H:i') }})</span>
+                                            {{ \App\Domain\Meeting\Support\LocalizedDateHelper::format($meeting->starts_at) }}
                                             · {{ __('meeting.type') }}: {{ $meeting->type->value }}
                                             · {{ __('meeting.status') }}: {{ $meeting->status->value }}
                                         </p>
@@ -54,8 +53,7 @@
                                         {{ $meeting->title }}
                                     </a>
                                     <p class="text-sm text-gray-500 dark:text-gray-400">
-                                        {{ \App\Domain\Meeting\Support\JalaliDateHelper::format($meeting->starts_at) }}
-                                        <span class="text-gray-400">({{ $meeting->starts_at->format('Y-m-d H:i') }})</span>
+                                        {{ \App\Domain\Meeting\Support\LocalizedDateHelper::format($meeting->starts_at) }}
                                         · {{ $meeting->status->value }}
                                     </p>
                                 </li>

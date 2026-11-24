@@ -14,7 +14,13 @@ final class FedwireService
     /**
      * Initiate a Fedwire RTGS transfer.
      *
-     * @return array{transaction_id: string, external_id: string, status: string, rail: string, amount: string, currency: string}
+     * There is no live Fedwire transmission endpoint: the instruction is
+     * recorded ONLY in simulation mode (see {@see RailTransmissionGate})
+     * with status INITIATED and `transmitted: false`. Outside simulation
+     * mode this throws {@see RailUnavailableException} and creates no row.
+     *
+     * @throws \App\Domain\PaymentRails\Exceptions\RailUnavailableException when the rail cannot transmit
+     * @return array{transaction_id: string, external_id: string, status: string, rail: string, amount: string, currency: string, transmitted: bool, simulation: bool}
      */
     public function sendTransfer(
         int $userId,
@@ -25,6 +31,8 @@ final class FedwireService
         string $beneficiaryRoutingNumber,
         ?string $reference = null,
     ): array {
+        RailTransmissionGate::ensureSimulationAllowed('Fedwire', 'fedwire');
+
         $externalId = 'FW-' . strtoupper(Str::random(16));
 
         $transaction = PaymentRailTransaction::create([
@@ -33,24 +41,29 @@ final class FedwireService
             'external_id' => $externalId,
             'amount'      => $amount,
             'currency'    => $currency,
-            'status'      => RailStatus::PROCESSING,
-            'direction'   => 'debit',
-            'metadata'    => [
+            // INITIATED, not PROCESSING: nothing was transmitted.
+            'status'    => RailStatus::INITIATED,
+            'direction' => 'debit',
+            'metadata'  => [
                 'beneficiary_name'           => $beneficiaryName,
                 'beneficiary_account_number' => $beneficiaryAccountNumber,
                 'beneficiary_routing_number' => $beneficiaryRoutingNumber,
                 'reference'                  => $reference,
                 'sender_aba'                 => config('payment_rails.fedwire.sender_aba'),
+                'transmitted'                => false,
+                'simulation'                 => true,
             ],
         ]);
 
         return [
             'transaction_id' => $transaction->id,
             'external_id'    => $externalId,
-            'status'         => RailStatus::PROCESSING->value,
+            'status'         => RailStatus::INITIATED->value,
             'rail'           => PaymentRail::FEDWIRE->value,
             'amount'         => $amount,
             'currency'       => $currency,
+            'transmitted'    => false,
+            'simulation'     => true,
         ];
     }
 

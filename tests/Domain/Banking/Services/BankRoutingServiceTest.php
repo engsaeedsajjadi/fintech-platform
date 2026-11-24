@@ -42,7 +42,7 @@ class BankRoutingServiceTest extends UnitTestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_returns_internal_for_same_bank_transfer(): void
     {
-        $result = $this->service->determineTransferType('PAYSERA', 'PAYSERA', 'EUR', 1000);
+        $result = $this->service->determineTransferType('PAYSERA', 'PAYSERA', 'EUR', '1000');
 
         expect($result)->toBe('INTERNAL');
     }
@@ -50,7 +50,7 @@ class BankRoutingServiceTest extends UnitTestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_returns_sepa_instant_for_eur_under_15000_between_european_banks(): void
     {
-        $result = $this->service->determineTransferType('PAYSERA', 'REVOLUT', 'EUR', 14999);
+        $result = $this->service->determineTransferType('PAYSERA', 'REVOLUT', 'EUR', '14999');
 
         expect($result)->toBe('SEPA_INSTANT');
     }
@@ -58,7 +58,7 @@ class BankRoutingServiceTest extends UnitTestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_returns_sepa_instant_for_eur_at_exactly_15000(): void
     {
-        $result = $this->service->determineTransferType('WISE', 'DEUTSCHE', 'EUR', 15000);
+        $result = $this->service->determineTransferType('WISE', 'DEUTSCHE', 'EUR', '15000');
 
         expect($result)->toBe('SEPA_INSTANT');
     }
@@ -66,7 +66,7 @@ class BankRoutingServiceTest extends UnitTestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_returns_sepa_for_eur_over_15000_between_european_banks(): void
     {
-        $result = $this->service->determineTransferType('PAYSERA', 'SANTANDER', 'EUR', 15001);
+        $result = $this->service->determineTransferType('PAYSERA', 'SANTANDER', 'EUR', '15001');
 
         expect($result)->toBe('SEPA');
     }
@@ -74,7 +74,7 @@ class BankRoutingServiceTest extends UnitTestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_returns_swift_for_non_eur_currency_between_european_banks(): void
     {
-        $result = $this->service->determineTransferType('PAYSERA', 'REVOLUT', 'USD', 1000);
+        $result = $this->service->determineTransferType('PAYSERA', 'REVOLUT', 'USD', '1000');
 
         expect($result)->toBe('SWIFT');
     }
@@ -82,7 +82,7 @@ class BankRoutingServiceTest extends UnitTestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_returns_swift_for_non_european_banks(): void
     {
-        $result = $this->service->determineTransferType('PAYSERA', 'CHASE', 'EUR', 1000);
+        $result = $this->service->determineTransferType('PAYSERA', 'CHASE', 'EUR', '1000');
 
         expect($result)->toBe('SWIFT');
     }
@@ -90,7 +90,7 @@ class BankRoutingServiceTest extends UnitTestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_returns_swift_for_international_transfer(): void
     {
-        $result = $this->service->determineTransferType('UNKNOWN_BANK', 'ANOTHER_BANK', 'GBP', 5000);
+        $result = $this->service->determineTransferType('UNKNOWN_BANK', 'ANOTHER_BANK', 'GBP', '5000');
 
         expect($result)->toBe('SWIFT');
     }
@@ -143,7 +143,7 @@ class BankRoutingServiceTest extends UnitTestCase
             ->with('REVOLUT', 24)
             ->andReturn(99.5);
 
-        $result = $this->service->getOptimalBank($user, 'EUR', 1000, 'SEPA', $userConnections);
+        $result = $this->service->getOptimalBank($user, 'EUR', '1000', 'SEPA', $userConnections);
 
         // REVOLUT should win due to faster response time, better uptime, and lower fees
         expect($result)->toBe('REVOLUT');
@@ -177,7 +177,7 @@ class BankRoutingServiceTest extends UnitTestCase
             ->with('WISE', 24)
             ->andReturn(98.0);
 
-        $result = $this->service->getOptimalBank($user, 'EUR', 1000, 'SEPA', $userConnections);
+        $result = $this->service->getOptimalBank($user, 'EUR', '1000', 'SEPA', $userConnections);
 
         expect($result)->toBe('WISE');
     }
@@ -208,7 +208,7 @@ class BankRoutingServiceTest extends UnitTestCase
         $this->healthMonitor->shouldReceive('getUptimePercentage')
             ->andReturn(90.0);
 
-        $result = $this->service->getOptimalBank($user, 'EUR', 1000, 'SEPA', $userConnections);
+        $result = $this->service->getOptimalBank($user, 'EUR', '1000', 'SEPA', $userConnections);
 
         expect($result)->toBe('REVOLUT');
     }

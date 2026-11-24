@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Domain\Banking\Models;
 
 use Carbon\Carbon;
+use Throwable;
 
 class BankConnection
 {
@@ -106,15 +107,22 @@ class BankConnection
 
     /**
      * Create from array.
+     *
+     * Accepts both `user_id` (the value object's own toArray shape) and
+     * `user_uuid` (the Eloquent model's column, as produced by
+     * BankConnectionModel::toArray()). Credentials may arrive as a
+     * plain array or as the model's encrypted string — the latter is
+     * decrypted here; an undecryptable value becomes an empty array
+     * rather than leaking ciphertext into the value object.
      */
     public static function fromArray(array $data): self
     {
         return new self(
             id: $data['id'],
-            userId: $data['user_id'],
+            userId: (string) ($data['user_id'] ?? $data['user_uuid'] ?? ''),
             bankCode: $data['bank_code'],
             status: $data['status'],
-            credentials: $data['credentials'] ?? [],
+            credentials: self::normalizeCredentials($data['credentials'] ?? []),
             permissions: $data['permissions'] ?? [],
             lastSyncAt: isset($data['last_sync_at']) ? Carbon::parse($data['last_sync_at']) : null,
             expiresAt: isset($data['expires_at']) ? Carbon::parse($data['expires_at']) : null,
@@ -122,6 +130,29 @@ class BankConnection
             updatedAt: Carbon::parse($data['updated_at']),
             metadata: $data['metadata'] ?? [],
         );
+    }
+
+    /**
+     * @param mixed $credentials
+     * @return array<string, mixed>
+     */
+    private static function normalizeCredentials(mixed $credentials): array
+    {
+        if (is_array($credentials)) {
+            return $credentials;
+        }
+
+        if (is_string($credentials) && $credentials !== '') {
+            try {
+                $decrypted = decrypt($credentials);
+
+                return is_array($decrypted) ? $decrypted : [];
+            } catch (Throwable) {
+                return [];
+            }
+        }
+
+        return [];
     }
 
     /**

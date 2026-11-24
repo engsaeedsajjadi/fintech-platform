@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use App\Domain\PaymentRails\Exceptions\RailUnavailableException;
 use App\Domain\PaymentRails\Services\PaymentRailRouter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -25,14 +26,24 @@ Route::prefix('v1/payment-rails')->name('api.payment-rails.')->middleware(['auth
         $router = app(PaymentRailRouter::class);
         /** @var App\Models\User $user */
         $user = $request->user();
-        $result = $router->route(
-            $user->id,
-            $validated['amount'],
-            $validated['currency'],
-            $validated['country'],
-            $validated['urgency'] ?? 'normal',
-            $validated['beneficiary'],
-        );
+
+        try {
+            $result = $router->route(
+                $user->id,
+                $validated['amount'],
+                $validated['currency'],
+                $validated['country'],
+                $validated['urgency'] ?? 'normal',
+                $validated['beneficiary'],
+            );
+        } catch (RailUnavailableException $e) {
+            // Explicit 503: no rail can carry this payment. Never a fake
+            // "pending" transaction and never a 500.
+            return response()->json([
+                'success' => false,
+                'error'   => ['code' => 'RAIL_UNAVAILABLE', 'message' => $e->getMessage()],
+            ], 503);
+        }
 
         return response()->json(['success' => true, 'data' => $result], 201);
     })->name('send');

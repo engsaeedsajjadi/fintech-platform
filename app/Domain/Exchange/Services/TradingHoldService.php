@@ -11,6 +11,7 @@ use App\Domain\Exchange\Exceptions\InsufficientTradingBalanceException;
 use App\Domain\Exchange\Models\TradingHold;
 use Brick\Math\BigDecimal;
 use Brick\Math\RoundingMode;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
@@ -33,6 +34,11 @@ class TradingHoldService
     /**
      * Reserve funds for an order/quote. Returns the created hold.
      *
+     * Exactly one active hold exists per (source_type, source_id,
+     * asset_code) — enforced by a unique index and by re-checking after
+     * the balance-row lock, so two concurrent reservations for the same
+     * source return the same hold instead of double-reserving.
+     *
      * @throws InsufficientTradingBalanceException
      */
     public function reserve(
@@ -46,6 +52,17 @@ class TradingHoldService
             throw new InsufficientTradingBalanceException("Cannot reserve a non-positive amount of {$assetCode}.");
         }
 
+        $account = $this->resolveAccount($accountId);
+
+        // Lock the balance row so concurrent reservations serialise.
+        $balanceRow = AccountBalance::where('account_uuid', $account->uuid ?? $accountId)
+            ->where('asset_code', $assetCode)
+            ->lockForUpdate()
+            ->first();
+
+        // Re-check AFTER the lock: a concurrent reservation for the same
+        // source may have committed while we waited for the lock. The
+        // pre-lock check alone cannot see it.
         $existing = TradingHold::where('source_type', $sourceType)
             ->where('source_id', $sourceId)
             ->where('asset_code', $assetCode)
@@ -56,14 +73,6 @@ class TradingHoldService
             return $existing;
         }
 
-        $account = $this->resolveAccount($accountId);
-
-        // Lock the balance row so concurrent reservations serialise.
-        $balanceRow = AccountBalance::where('account_uuid', $account->uuid ?? $accountId)
-            ->where('asset_code', $assetCode)
-            ->lockForUpdate()
-            ->first();
-
         $available = $this->availableBalance($accountId, $assetCode, $balanceRow?->balance);
 
         if (BigDecimal::of($available)->isLessThan($amount)) {
@@ -72,16 +81,37 @@ class TradingHoldService
             );
         }
 
-        return TradingHold::create([
-            'hold_id'      => (string) Str::uuid(),
-            'account_id'   => $accountId,
-            'account_uuid' => $account?->uuid,
-            'asset_code'   => $assetCode,
-            'amount'       => BigDecimal::of($amount)->toScale(18)->__toString(),
-            'source_type'  => $sourceType,
-            'source_id'    => $sourceId,
-            'status'       => 'active',
-        ]);
+        try {
+            return TradingHold::create([
+                'hold_id'      => (string) Str::uuid(),
+                'account_id'   => $accountId,
+                'account_uuid' => $account?->uuid,
+                'asset_code'   => $assetCode,
+                'amount'       => BigDecimal::of($amount)->toScale(18)->__toString(),
+                'source_type'  => $sourceType,
+                'source_id'    => $sourceId,
+                'status'       => 'active',
+            ]);
+        } catch (QueryException $e) {
+            // Lost the create race despite the re-check (the unique index
+            // on source_type/source_id/asset_code is the final arbiter):
+            // return the winner's hold instead of a second reservation.
+            if (! $this->isUniqueViolation($e)) {
+                throw $e;
+            }
+
+            $winner = TradingHold::where('source_type', $sourceType)
+                ->where('source_id', $sourceId)
+                ->where('asset_code', $assetCode)
+                ->active()
+                ->first();
+
+            if ($winner !== null) {
+                return $winner;
+            }
+
+            throw $e;
+        }
     }
 
     /**
@@ -109,9 +139,25 @@ class TradingHoldService
     /**
      * Reduce a hold by a consumed amount (partial fills). When the hold is
      * fully consumed it is marked consumed.
+     *
+     * The row is re-read first: consuming from a stale in-memory amount
+     * would silently under-consume when two fills touch the same hold.
+     * A hold that is no longer active is returned untouched — a second
+     * consume of an already-consumed hold is a no-op, never a double
+     * release of funds.
      */
     public function consume(TradingHold $hold, string $amount): TradingHold
     {
+        $hold->refresh();
+
+        if ($hold->status !== 'active') {
+            return $hold;
+        }
+
+        if (BigDecimal::of($amount)->isLessThanOrEqualTo(0)) {
+            return $hold;
+        }
+
         $remaining = BigDecimal::of((string) $hold->amount)->minus($amount)->toScale(18, RoundingMode::DOWN)->__toString();
 
         if (BigDecimal::of($remaining)->isLessThanOrEqualTo(0)) {
@@ -128,6 +174,8 @@ class TradingHoldService
     /** Release the whole remaining hold (cancel / expiry / rejection). */
     public function release(TradingHold $hold): TradingHold
     {
+        $hold->refresh();
+
         if ($hold->status !== 'active') {
             return $hold;
         }
@@ -167,5 +215,13 @@ class TradingHoldService
         }
 
         return Account::where('uuid', $accountId)->first();
+    }
+
+    private function isUniqueViolation(QueryException $e): bool
+    {
+        // SQLSTATE 23000 covers SQLite, MySQL and Postgres unique violations.
+        return $e->getCode() === '23000'
+            || str_contains($e->getMessage(), 'UNIQUE constraint failed')
+            || str_contains($e->getMessage(), 'Duplicate entry');
     }
 }

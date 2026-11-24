@@ -44,6 +44,17 @@ function opsVerifyEnvAllGoodConfig(): void
         'ai.demo_mode'                            => false,
         'compliance-certification.soc2.demo_mode' => false,
 
+        // Phase 8 simulation opt-ins (preflight FAILs while on)
+        'asset.sandbox_rates_enabled'                  => false,
+        'exchange.providers.mock.enabled'              => false,
+        'kyc.verification.simulated_providers_enabled' => false,
+        'payment_rails.simulation.enabled'             => false,
+
+        // Phase 8: no localhost CORS origin in production (the config
+        // default still carries the localhost list in testing, where the
+        // config was loaded at boot).
+        'cors.allowed_origins' => ['https://app.finaegis.org'],
+
         // conditional
         'hyperswitch.enabled'              => false,
         'wallet.solana.sponsor.secret_key' => '',

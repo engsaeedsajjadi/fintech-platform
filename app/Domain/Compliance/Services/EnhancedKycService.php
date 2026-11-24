@@ -4,6 +4,7 @@ namespace App\Domain\Compliance\Services;
 
 use App\Domain\Compliance\Events\KycVerificationCompleted;
 use App\Domain\Compliance\Events\KycVerificationStarted;
+use App\Domain\Compliance\Models\AuditLog;
 use App\Domain\Compliance\Models\CustomerRiskProfile;
 use App\Domain\Compliance\Models\KycVerification;
 use App\Models\User;
@@ -20,14 +21,42 @@ class EnhancedKycService
 
     private BiometricVerificationService $biometricService;
 
+    private ?KycService $kycService;
+
     public function __construct(
         IdentityVerificationService $identityService,
         DocumentAnalysisService $documentService,
-        BiometricVerificationService $biometricService
+        BiometricVerificationService $biometricService,
+        ?KycService $kycService = null
     ) {
         $this->identityService = $identityService;
         $this->documentService = $documentService;
         $this->biometricService = $biometricService;
+        $this->kycService = $kycService;
+    }
+
+    private function kycService(): KycService
+    {
+        return $this->kycService ??= app(KycService::class);
+    }
+
+    /**
+     * Audit a move to `requires_manual_review`. The verification status
+     * change alone is not an audit trail — every such transition gets an
+     * AuditLog row so the manual-review queue is reconstructible.
+     */
+    private function auditManualReview(KycVerification $verification, string $reason): void
+    {
+        $user = $verification->user;
+
+        AuditLog::log(
+            'kyc.manual_review.requested',
+            $user,
+            ['kyc_status'      => $user?->kyc_status],
+            ['kyc_status'      => 'requires_manual_review'],
+            ['verification_id' => $verification->getKey(), 'reason' => $reason],
+            'kyc,compliance,manual-review'
+        );
     }
 
     /**
@@ -111,6 +140,7 @@ class EnhancedKycService
 
             if ($this->isSandboxResult($extractedData) || $this->isSandboxResult($authenticityCheck) || $this->isSandboxResult($identityCheck)) {
                 $verification->update(['status' => KycVerification::STATUS_REQUIRES_MANUAL_REVIEW]);
+                $this->auditManualReview($verification, 'Document / identity evidence came from a simulated provider; manual review required.');
 
                 return [
                     'success'                => false,
@@ -167,6 +197,7 @@ class EnhancedKycService
                         ),
                     ]
                 );
+                $this->auditManualReview($verification, 'Liveness evidence came from a simulated provider; manual review required.');
 
                 return [
                     'success'                => false,
@@ -197,6 +228,7 @@ class EnhancedKycService
                             ),
                         ]
                     );
+                    $this->auditManualReview($verification, 'Face-match evidence came from a simulated provider; manual review required.');
 
                     return [
                         'success'                => false,
@@ -279,6 +311,7 @@ class EnhancedKycService
 
             if ($this->isSandboxResult($extractedData)) {
                 $verification->update(['status' => KycVerification::STATUS_REQUIRES_MANUAL_REVIEW]);
+                $this->auditManualReview($verification, 'Address evidence came from a simulated provider; manual review required.');
 
                 return [
                     'success'                => false,
@@ -337,6 +370,7 @@ class EnhancedKycService
             function () use ($verification) {
                 // Perform final checks
                 $riskAssessment = $this->assessVerificationRisk($verification);
+                $oldStatus = $verification->status;
 
                 $verification->update(
                     [
@@ -353,6 +387,15 @@ class EnhancedKycService
 
                 // Update or create risk profile
                 $this->updateRiskProfile($verification);
+
+                AuditLog::log(
+                    'kyc.verification_completed',
+                    $verification->user,
+                    ['verification_status' => $oldStatus],
+                    ['verification_status' => KycVerification::STATUS_COMPLETED],
+                    ['verification_id'     => $verification->getKey(), 'risk_level' => $riskAssessment['level']],
+                    'kyc,compliance,verification'
+                );
 
                 event(new KycVerificationCompleted($verification));
             }
@@ -510,10 +553,21 @@ class EnhancedKycService
 
     /**
      * Update user KYC status.
+     *
+     * Approval goes through KycService::verifyKyc() so the status change
+     * passes KycStatusMachine (audited transition, basis
+     * `provider_verdict`: this method is unreachable for sandbox evidence
+     * — completeVerification() refuses it first). A user who is already
+     * approved (completing an additional verification type) keeps their
+     * status; only level / expiry / risk are refreshed, with an audit row.
      */
     protected function updateUserKycStatus(KycVerification $verification): void
     {
         $user = $verification->user;
+
+        if (! $user instanceof User) {
+            throw new LogicException('Cannot complete a verification that has no user.');
+        }
 
         // Determine KYC level based on verification types completed
         $completedTypes = KycVerification::where('user_id', $user->id)
@@ -525,15 +579,33 @@ class EnhancedKycService
 
         $kycLevel = $this->determineKycLevel($completedTypes);
 
-        $user->update(
-            [
-                'kyc_status'      => 'approved',
-                'kyc_level'       => $kycLevel,
-                'kyc_approved_at' => now(),
-                'kyc_expires_at'  => $verification->expires_at,
-                'risk_rating'     => $verification->risk_level,
-            ]
-        );
+        if ($user->kyc_status === 'approved') {
+            $user->update(
+                [
+                    'kyc_level'      => $kycLevel,
+                    'kyc_expires_at' => $verification->expires_at,
+                    'risk_rating'    => $verification->risk_level,
+                ]
+            );
+
+            AuditLog::log(
+                'kyc.approved',
+                $user,
+                ['kyc_status'  => 'approved'],
+                ['kyc_status'  => 'approved', 'kyc_level' => $kycLevel],
+                ['verified_by' => 'system', 'renewal' => true, 'verification_id' => $verification->getKey()],
+                'kyc,compliance,verification'
+            );
+
+            return;
+        }
+
+        $this->kycService()->verifyKyc($user, 'system', [
+            'level'       => $kycLevel,
+            'risk_rating' => $verification->risk_level,
+            'expires_at'  => $verification->expires_at,
+            'basis'       => KycStatusMachine::BASIS_PROVIDER_VERDICT,
+        ]);
     }
 
     /**

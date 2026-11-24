@@ -5,17 +5,35 @@ namespace App\Domain\Exchange\Activities;
 use App\Domain\Exchange\Projections\Order;
 use App\Domain\Exchange\Services\FeeCalculator;
 use Brick\Math\BigDecimal;
-use Cache;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 use Workflow\Activity;
+use Workflow\Models\StoredWorkflow;
 
 class MatchOrderActivity extends Activity
 {
     private FeeCalculator $feeCalculator;
 
-    public function __construct()
-    {
+    /**
+     * Dual-mode constructor: with no arguments the activity runs
+     * synchronously outside the durable-workflow runtime (as the sync
+     * order-book service does); with the runtime's (index, now,
+     * storedWorkflow, ...args) the parent constructor runs so the
+     * activity can be dispatched as a queued job. A plain no-arg
+     * constructor broke runtime dispatch — Dispatchable::dispatch()
+     * constructs with the runtime arguments.
+     */
+    public function __construct(
+        int $index = 0,
+        string $now = '',
+        ?StoredWorkflow $storedWorkflow = null,
+        mixed ...$arguments,
+    ) {
         $this->feeCalculator = new FeeCalculator();
+
+        if ($storedWorkflow !== null) {
+            parent::__construct($index, $now, $storedWorkflow, ...$arguments);
+        }
     }
 
     public function execute(string $orderId, int $maxIterations = 100): object
@@ -33,6 +51,13 @@ class MatchOrderActivity extends Activity
         $matches = collect();
         $remainingAmount = BigDecimal::of($order->remaining_amount);
         $iterations = 0;
+        // Amounts already matched against each maker inside THIS run.
+        // The maker's stored remaining_amount does not change until
+        // settlement persists the match, so without this the loop would
+        // match the same maker again at its full remaining amount and
+        // emit a spurious second match (settlement clamps it to zero,
+        // but the match itself must not exist).
+        $consumedByOrder = [];
 
         while ($remainingAmount->isPositive() && $iterations < $maxIterations) {
             $iterations++;
@@ -45,7 +70,12 @@ class MatchOrderActivity extends Activity
             }
 
             // Calculate execution details
-            $executionDetails = $this->calculateExecution($order, $matchingOrder, $remainingAmount);
+            $executionDetails = $this->calculateExecution(
+                $order,
+                $matchingOrder,
+                $remainingAmount,
+                $consumedByOrder[$matchingOrder->order_id] ?? '0',
+            );
 
             if ($executionDetails->executedAmount->isZero()) {
                 break; // Cannot execute
@@ -66,6 +96,9 @@ class MatchOrderActivity extends Activity
 
             // Update remaining amount
             $remainingAmount = $remainingAmount->minus($executionDetails->executedAmount);
+            $consumedByOrder[$matchingOrder->order_id] = BigDecimal::of(
+                $consumedByOrder[$matchingOrder->order_id] ?? '0'
+            )->plus($executionDetails->executedAmount)->__toString();
 
             // Mark matching order for update
             $this->markOrderForUpdate($matchingOrder->order_id, $executionDetails->executedAmount);
@@ -115,7 +148,7 @@ class MatchOrderActivity extends Activity
         return $query->first();
     }
 
-    private function calculateExecution(Order $takerOrder, Order $makerOrder, BigDecimal $remainingAmount): object
+    private function calculateExecution(Order $takerOrder, Order $makerOrder, BigDecimal $remainingAmount, string $alreadyMatchedAgainstMaker = '0'): object
     {
         // The execution price is ALWAYS the resting (maker) limit price.
         // A market taker executes at the maker's price; a limit taker
@@ -133,9 +166,15 @@ class MatchOrderActivity extends Activity
 
         $executedPrice = BigDecimal::of($makerOrder->price);
 
-        // Calculate executed amount (minimum of both orders' remaining amounts)
-        $makerRemaining = BigDecimal::of($makerOrder->remaining_amount);
-        $executedAmount = $remainingAmount->min($makerRemaining);
+        // Calculate executed amount (minimum of both orders' remaining amounts).
+        // The maker's remaining is net of what this run already matched
+        // against it — its stored row is unchanged until settlement.
+        // NOTE: Brick's min() is STATIC (BigDecimal::min(...)); the old
+        // instance call $remainingAmount->min($x) ignored the taker's
+        // remaining entirely and always executed the maker's full amount.
+        $makerRemaining = BigDecimal::of($makerOrder->remaining_amount)
+            ->minus(BigDecimal::of($alreadyMatchedAgainstMaker));
+        $executedAmount = BigDecimal::min($remainingAmount, $makerRemaining);
 
         // Calculate fees
         $fees = $this->feeCalculator->calculateFees(

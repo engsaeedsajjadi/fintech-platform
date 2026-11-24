@@ -20,6 +20,17 @@ Route::get('/app', function () {
     return view('app');
 })->name('app.landing');
 
+// Locale switcher (fa/en only): stores the choice in the session; the
+// SetLocale middleware applies it on every web/API request. Unknown
+// locales are ignored and the user is sent back where they came from.
+Route::post('/locale/{locale}', function (string $locale) {
+    if (in_array($locale, \App\Http\Middleware\SetLocale::SUPPORTED, true)) {
+        session(['locale' => $locale]);
+    }
+
+    return back();
+})->name('locale.switch');
+
 // Public consumer-facing MCP onboarding flow. Available on production
 // (zelta.app) and demo alike — the agentic-payments brand voice fits
 // both surfaces and we want a single canonical "connect to AI" page.
@@ -1128,4 +1139,19 @@ Route::middleware(['auth', 'verified'])->prefix('dashboard')->name('dashboard.')
 
         return back();
     })->name('meetings.messages.store');
+
+    Route::post('/meetings/{meeting}/respond', function (\Illuminate\Http\Request $request, \App\Domain\Meeting\Models\Meeting $meeting) {
+        $request->validate(['status' => ['required', 'string', 'in:accepted,declined']]);
+        try {
+            app(\App\Domain\Meeting\Services\MeetingService::class)->respondToInvitation(
+                $meeting,
+                Auth::user(),
+                \App\Domain\Meeting\Enums\ParticipantStatus::from($request->input('status'))
+            );
+        } catch (\Throwable $e) {
+            return back()->withErrors(['meeting' => $e->getMessage()]);
+        }
+
+        return back()->with('status', __('meeting.invitation_'.$request->input('status')));
+    })->name('meetings.respond');
 });

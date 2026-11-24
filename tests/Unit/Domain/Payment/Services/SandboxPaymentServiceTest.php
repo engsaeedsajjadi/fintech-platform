@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Tests\Unit\Domain\Payment\Services;
 
 use App\Domain\Account\Models\Account;
+use App\Domain\Ledger\Enums\TransactionState;
+use App\Domain\Payment\Models\PaymentIntent;
 use App\Domain\Payment\Services\SandboxPaymentService;
 use App\Models\User;
 use Illuminate\Support\Facades\Log;
@@ -50,8 +52,17 @@ class SandboxPaymentServiceTest extends TestCase
 
         $result = $this->service->processStripeDeposit($data);
 
-        // Assert that a sandbox transaction ID was returned
-        $this->assertStringStartsWith('sandbox_txn_', $result);
+        // The returned id is a persisted payment intent in PROCESSING —
+        // never a fabricated 'sandbox_txn_…' id. Its final state comes
+        // only from the provider (webhook / status query).
+        $intent = PaymentIntent::query()->findOrFail($result);
+        $this->assertEquals('stripe', $intent->provider);
+        $this->assertEquals(10000, $intent->amount_minor);
+        $this->assertEquals('USD', $intent->currency);
+        $this->assertEquals(TransactionState::PROCESSING, $intent->state);
+        $this->assertEquals($data['account_uuid'], $intent->account_uuid);
+        $this->assertTrue($intent->metadata['test_mode']);
+        $this->assertTrue($intent->metadata['original']);
 
         // Verify log was called with sandbox metadata
         /** @phpstan-ignore-next-line */
@@ -115,7 +126,9 @@ class SandboxPaymentServiceTest extends TestCase
         ];
 
         $stripeResult = $this->service->processStripeDeposit($stripeData);
-        $this->assertStringStartsWith('sandbox_txn_', $stripeResult);
+        $stripeIntent = PaymentIntent::query()->findOrFail($stripeResult);
+        $this->assertEquals(TransactionState::PROCESSING, $stripeIntent->state);
+        $this->assertEquals('stripe', $stripeIntent->provider);
 
         // Test bank withdrawal
         $withdrawalData = [
@@ -132,6 +145,9 @@ class SandboxPaymentServiceTest extends TestCase
         $this->assertArrayHasKey('reference', $withdrawalResult);
         $this->assertEquals($withdrawalData['reference'], $withdrawalResult['reference']);
         $this->assertEquals('processing', $withdrawalResult['status']);
+        $withdrawalIntent = PaymentIntent::query()->findOrFail($withdrawalResult['intent_id']);
+        $this->assertEquals(TransactionState::PROCESSING, $withdrawalIntent->state);
+        $this->assertEquals('bank', $withdrawalIntent->provider);
     }
 
     public function test_sandbox_service_preserves_original_metadata(): void

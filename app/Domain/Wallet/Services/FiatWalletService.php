@@ -10,6 +10,7 @@ use App\Domain\Ledger\Models\LedgerAccount;
 use App\Domain\Ledger\Services\LedgerService;
 use App\Domain\Wallet\Exceptions\InsufficientBalanceException;
 use App\Domain\Wallet\Exceptions\InvalidAssetException;
+use App\Domain\Wallet\Models\Conversion;
 use App\Domain\Wallet\Models\FiatDeposit;
 use App\Domain\Wallet\Models\FiatTransfer;
 use App\Domain\Wallet\Models\FiatWithdrawal;
@@ -369,6 +370,12 @@ final class FiatWalletService
      * intent tables. A mismatch is reported as requires-manual-review and
      * is NEVER auto-corrected here.
      *
+     * Every balance-changing record counts: deposits, withdrawals,
+     * transfers AND conversions. (The old version ignored conversions,
+     * so every fiat conversion left a false requires-manual-review
+     * mismatch behind.) Sums are exact decimal sums, never SQL SUM
+     * through a float cast.
+     *
      * @return array{account_uuid: string, currency: string, ledger_balance: string, expected_balance: string, difference: string, matched: bool, status: string}
      */
     public function reconcile(string $accountUuid, string $currency): array
@@ -376,17 +383,25 @@ final class FiatWalletService
         $currency = $this->validateCurrency($currency);
         $ledgerBalance = $this->balance($accountUuid, $currency);
 
-        $depositsNet = (string) FiatDeposit::query()->where('account_uuid', $accountUuid)->where('currency', $currency)
-            ->where('status', FiatDeposit::STATUS_COMPLETED)->sum('net_amount');
-        $withdrawals = (string) FiatWithdrawal::query()->where('account_uuid', $accountUuid)->where('currency', $currency)
-            ->where('status', FiatWithdrawal::STATUS_COMPLETED)->sum('amount');
+        $depositsNet = DecimalMath::exactSum(FiatDeposit::query()->where('account_uuid', $accountUuid)->where('currency', $currency)
+            ->where('status', FiatDeposit::STATUS_COMPLETED)->pluck('net_amount')->all());
+        $withdrawals = DecimalMath::exactSum(FiatWithdrawal::query()->where('account_uuid', $accountUuid)->where('currency', $currency)
+            ->where('status', FiatWithdrawal::STATUS_COMPLETED)->pluck('amount')->all());
         $out = FiatTransfer::query()->where('from_account_uuid', $accountUuid)->where('currency', $currency)
             ->where('status', FiatTransfer::STATUS_COMPLETED)->get();
         $in = FiatTransfer::query()->where('to_account_uuid', $accountUuid)->where('currency', $currency)
             ->where('status', FiatTransfer::STATUS_COMPLETED)->get();
+        // Conversions: the source wallet is debited the full from_amount
+        // (fee included) and the target wallet is credited to_amount.
+        $conversionOut = DecimalMath::exactSum(Conversion::query()->where('account_uuid', $accountUuid)->where('from_asset', $currency)
+            ->where('status', Conversion::STATUS_COMPLETED)->pluck('from_amount')->all());
+        $conversionIn = DecimalMath::exactSum(Conversion::query()->where('account_uuid', $accountUuid)->where('to_asset', $currency)
+            ->where('status', Conversion::STATUS_COMPLETED)->pluck('to_amount')->all());
 
         $expected = DecimalMath::scale4($depositsNet);
         $expected = DecimalMath::sub($expected, DecimalMath::scale4($withdrawals));
+        $expected = DecimalMath::sub($expected, DecimalMath::scale4($conversionOut));
+        $expected = DecimalMath::add($expected, DecimalMath::scale4($conversionIn));
         foreach ($out as $t) {
             $expected = DecimalMath::sub($expected, DecimalMath::scale4((string) $t->amount));
         }

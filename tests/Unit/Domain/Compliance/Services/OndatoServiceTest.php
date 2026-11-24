@@ -369,7 +369,9 @@ describe('processWebhook', function () {
 
         $verification->refresh();
         expect($verification->status)->toBe(KycVerification::STATUS_COMPLETED);
-        expect($verification->confidence_score)->toBe('95.00');
+        // The Ondato record carries no confidence score, so none is
+        // invented: the old hardcoded 95.00 was fabricated evidence.
+        expect($verification->confidence_score)->toBeNull();
 
         $user->refresh();
         expect($user->kyc_status)->toBe('approved');

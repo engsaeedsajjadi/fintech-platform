@@ -6,9 +6,12 @@ namespace App\Domain\Asset\Services;
 
 use App\Domain\Asset\Models\Asset;
 use App\Domain\Asset\Models\ExchangeRate;
+use Brick\Math\BigDecimal;
+use Brick\Math\RoundingMode;
 use Exception;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use InvalidArgumentException;
 
 class ExchangeRateService
 {
@@ -84,9 +87,18 @@ class ExchangeRateService
 
     /**
      * Fetch exchange rate from external API and store it.
+     *
+     * Fail-closed: when the sandbox rate source is disabled
+     * (config/asset.php — off in production), the hardcoded mock tables
+     * below are never consulted and this returns null, so callers see
+     * "no rate available" instead of settling at an invented price.
      */
     public function fetchAndStoreRate(string $fromAsset, string $toAsset): ?ExchangeRate
     {
+        if (! $this->sandboxRatesEnabled()) {
+            return null;
+        }
+
         try {
             // First, check if we can use a chain conversion through USD
             if ($fromAsset !== 'USD' && $toAsset !== 'USD') {
@@ -111,8 +123,8 @@ class ExchangeRateService
                 $fromAsset,
                 $toAsset,
                 $rateData['rate'],
-                ExchangeRate::SOURCE_API,
-                $rateData['metadata'] ?? []
+                ExchangeRate::SOURCE_SANDBOX,
+                array_merge($rateData['metadata'] ?? [], ['provider' => 'sandbox_mock']),
             );
         } catch (Exception $e) {
             Log::error(
@@ -141,19 +153,25 @@ class ExchangeRateService
             return null;
         }
 
-        // Calculate chained rate
-        $chainedRate = $fromToUsdData['rate'] * $usdToToData['rate'];
+        // Calculate chained rate exactly (bcmath, never float): a float
+        // product silently rounds the rate before it is stored.
+        /** @var numeric-string $fromUsdRate */
+        $fromUsdRate = (string) $fromToUsdData['rate'];
+        /** @var numeric-string $usdToRate */
+        $usdToRate = (string) $usdToToData['rate'];
+        $chainedRate = bcmul($fromUsdRate, $usdToRate, 10);
 
         return $this->storeRate(
             $fromAsset,
             $toAsset,
-            $chainedRate,
-            ExchangeRate::SOURCE_API,
+            (float) $chainedRate,
+            ExchangeRate::SOURCE_SANDBOX,
             [
                 'chained'       => true,
                 'via'           => 'USD',
                 'from_usd_rate' => $fromToUsdData['rate'],
                 'usd_to_rate'   => $usdToToData['rate'],
+                'provider'      => 'sandbox_mock',
             ]
         );
     }
@@ -187,10 +205,14 @@ class ExchangeRateService
 
     /**
      * Fetch rate from cryptocurrency API.
+     *
+     * SANDBOX FIXTURE ONLY: hardcoded prices, reachable only while
+     * config('asset.sandbox_rates_enabled') is on (see fetchAndStoreRate).
+     * A real provider (CoinGecko / CoinMarketCap / ...) is not wired.
      */
     private function fetchFromCryptoProvider(string $fromAsset, string $toAsset): ?array
     {
-        // Mock implementation - in production, integrate with CoinGecko, CoinMarketCap, etc.
+        // Sandbox fixture — in production, integrate with CoinGecko, CoinMarketCap, etc.
         $mockRates = [
             'BTC-USD' => 42000.00,
             'USD-BTC' => 0.0000238,
@@ -216,10 +238,14 @@ class ExchangeRateService
 
     /**
      * Fetch rate from fiat currency API.
+     *
+     * SANDBOX FIXTURE ONLY: hardcoded prices, reachable only while
+     * config('asset.sandbox_rates_enabled') is on (see fetchAndStoreRate).
+     * A real provider (Fixer.io, ExchangeRate-API, ...) is not wired here.
      */
     private function fetchFromFiatProvider(string $fromAsset, string $toAsset): ?array
     {
-        // Mock implementation - in production, integrate with Fixer.io, ExchangeRate-API, etc.
+        // Sandbox fixture — in production, integrate with Fixer.io, ExchangeRate-API, etc.
         $mockRates = [
             'USD-EUR' => 0.85,
             'EUR-USD' => 1.18,
@@ -245,10 +271,13 @@ class ExchangeRateService
 
     /**
      * Fetch rate from commodity API.
+     *
+     * SANDBOX FIXTURE ONLY: hardcoded prices, reachable only while
+     * config('asset.sandbox_rates_enabled') is on (see fetchAndStoreRate).
      */
     private function fetchFromCommodityProvider(string $fromAsset, string $toAsset): ?array
     {
-        // Mock implementation - in production, integrate with commodity APIs
+        // Sandbox fixture — in production, integrate with commodity APIs
         $mockRates = [
             'XAU-USD' => 2000.00,
             'USD-XAU' => 0.0005,
@@ -269,20 +298,29 @@ class ExchangeRateService
     }
 
     /**
-     * Store a new exchange rate.
+     * Store a new exchange rate. The rate is normalised to an exact
+     * decimal string at scale 10; a non-positive or non-finite rate is
+     * refused instead of stored.
+     *
+     * @param  float|string  $rate
      */
     public function storeRate(
         string $fromAsset,
         string $toAsset,
-        float $rate,
+        float|string $rate,
         string $source = ExchangeRate::SOURCE_MANUAL,
         array $metadata = []
     ): ExchangeRate {
+        $rateDecimal = (string) BigDecimal::of((string) $rate)->toScale(10, RoundingMode::HALF_UP);
+        if (BigDecimal::of($rateDecimal)->isLessThanOrEqualTo(BigDecimal::zero())) {
+            throw new InvalidArgumentException("Exchange rate for {$fromAsset}/{$toAsset} must be a positive number, got '{$rate}'.");
+        }
+
         $exchangeRate = ExchangeRate::create(
             [
                 'from_asset_code' => $fromAsset,
                 'to_asset_code'   => $toAsset,
-                'rate'            => $rate,
+                'rate'            => $rateDecimal,
                 'source'          => $source,
                 'valid_at'        => now(),
                 'expires_at'      => now()->addHours(1), // Default 1 hour expiry
@@ -295,6 +333,24 @@ class ExchangeRateService
         Cache::forget("exchange_rate:{$fromAsset}:{$toAsset}");
 
         return $exchangeRate;
+    }
+
+    /**
+     * Whether the hardcoded sandbox rate tables may be consulted.
+     *
+     * Phase 8: this used to be a bare config flag — an operator who set
+     * ASSET_SANDBOX_RATES_ENABLED=true in production would silently serve
+     * invented prices (BTC 42000, USD/EUR 0.85) on money paths. The flag
+     * now only takes effect outside production, matching the repo's other
+     * simulation gates (KycVerificationGate, DemoModeGuard).
+     */
+    private function sandboxRatesEnabled(): bool
+    {
+        if (app()->environment('production')) {
+            return false;
+        }
+
+        return (bool) config('asset.sandbox_rates_enabled', false);
     }
 
     /**

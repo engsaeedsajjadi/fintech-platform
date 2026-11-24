@@ -18,12 +18,14 @@ class BankRoutingService
 
     /**
      * Determine optimal transfer type between banks.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
      */
     public function determineTransferType(
         string $fromBank,
         string $toBank,
         string $currency,
-        float $amount
+        string $amount
     ): string {
         // Same bank transfers
         if ($fromBank === $toBank) {
@@ -32,8 +34,8 @@ class BankRoutingService
 
         // EUR transfers within EU
         if ($currency === 'EUR' && $this->areBothEuropean($fromBank, $toBank)) {
-            // Use instant SEPA for small amounts
-            if ($amount <= 15000) {
+            // Use instant SEPA for small amounts (exact comparison).
+            if (bccomp($amount, '15000', 4) !== 1) {
                 return 'SEPA_INSTANT';
             }
 
@@ -46,11 +48,13 @@ class BankRoutingService
 
     /**
      * Get optimal bank for a specific operation.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
      */
     public function getOptimalBank(
         User $user,
         string $currency,
-        float $amount,
+        string $amount,
         string $transferType,
         Collection $userConnections
     ): string {
@@ -79,11 +83,13 @@ class BankRoutingService
 
     /**
      * Calculate bank score for routing decision.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
      */
     private function calculateBankScore(
         string $bankCode,
         string $currency,
-        float $amount,
+        string $amount,
         string $transferType
     ): float {
         $score = 0;
@@ -133,12 +139,18 @@ class BankRoutingService
 
     /**
      * Calculate fee score for a bank.
+     *
+     * The fee table holds fixed fees, so the amount only matters for
+     * future tiered fees — it is accepted as an exact decimal string
+     * and never converted to float.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
      */
     private function calculateFeeScore(
         string $bankCode,
         string $transferType,
         string $currency,
-        float $amount
+        string $amount
     ): float {
         // This would be calculated based on actual fee structures
         // For now, return a mock score

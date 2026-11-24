@@ -35,6 +35,8 @@ return [
     App\Providers\PrivacyServiceProvider::class,
     App\Providers\RegTechServiceProvider::class,
     App\Providers\RampServiceProvider::class,
+    App\Providers\SafeDealServiceProvider::class,
+    App\Domain\International\Providers\InternationalServiceProvider::class,
     App\Providers\SmsServiceProvider::class,
     App\Providers\RelayerServiceProvider::class,
     App\Providers\StablecoinServiceProvider::class,

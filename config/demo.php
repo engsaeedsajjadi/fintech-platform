@@ -13,12 +13,32 @@ return [
     |
     */
 
+    /*
+    |----------------------------------------------------------------------
+    | Production refusal for the KYC-bypass flags
+    |----------------------------------------------------------------------
+    |
+    | `skip_kyc` and `auto_approve` default to TRUE in non-production
+    | environments (demo / local / testing) — verified: DEMO_SKIP_KYC is
+    | currently not consumed by any code path, and DEMO_AUTO_APPROVE is
+    | consumed only by the demo-domain services (DemoExchangeService,
+    | DemoLendingService, DemoBlockchainService), never by the KYC
+    | state machine, so neither flag can approve a user today. The
+    | defaults are still dangerous to inherit silently, so under
+    | APP_ENV=production an UNSET flag now defaults to FALSE instead of
+    | true. An EXPLICITLY set true in production is refused by the
+    | deploy preflight: `php artisan ops:verify-env` reports
+    | `demo.features` FAIL, which blocks the deploy in production
+    | (and in CI, where deploy.yml runs it). A boot-time throw was
+    | deliberately NOT added: it would crash the preflight itself, so
+    | no other misconfiguration would be reported.
+    */
     'features' => [
         'instant_deposits'     => env('DEMO_INSTANT_DEPOSITS', true),
-        'skip_kyc'             => env('DEMO_SKIP_KYC', true),
+        'skip_kyc'             => env('DEMO_SKIP_KYC', env('APP_ENV', 'production') !== 'production'),
         'mock_external_apis'   => env('DEMO_MOCK_EXTERNAL_APIS', true),
         'fixed_exchange_rates' => env('DEMO_FIXED_EXCHANGE_RATES', true),
-        'auto_approve'         => env('DEMO_AUTO_APPROVE', true),
+        'auto_approve'         => env('DEMO_AUTO_APPROVE', env('APP_ENV', 'production') !== 'production'),
     ],
 
     /*

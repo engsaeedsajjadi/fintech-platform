@@ -95,13 +95,24 @@ class OrderMatchingWorkflow extends Workflow
         // Step 5: Process each match
         foreach ($matchingResult->matches as $match) {
             try {
-                // Transfer assets between accounts
+                // The taker is the workflow's input order; the maker is the
+                // resting order on the other side of the match.
+                $makerSide = $match->buyOrderId === $input->orderId ? 'sell' : 'buy';
+
+                // Transfer assets between accounts. The match's own trade
+                // id (and fees) are passed through: minting a new id here
+                // used to double-fill, because the follow-up matchOrder()
+                // calls below record the match under $match->tradeId.
                 $transferResult = yield ActivityStub::make(
                     TransferAssetsActivity::class,
                     $match->buyOrderId,
                     $match->sellOrderId,
                     $match->executedAmount,
-                    $match->executedPrice
+                    $match->executedPrice,
+                    $match->tradeId,
+                    $match->makerFee,
+                    $match->takerFee,
+                    $makerSide,
                 );
 
                 if (! $transferResult->success) {
@@ -115,14 +126,18 @@ class OrderMatchingWorkflow extends Workflow
                     continue;
                 }
 
-                // Update both orders
+                // Update both orders. These are no-ops when settlement
+                // already recorded the match (same trade id, guarded in
+                // the aggregate) — they exist so a match is still recorded
+                // if the transfer activity is ever bypassed.
                 Order::retrieve($match->buyOrderId)->matchOrder(
                     matchedOrderId: $match->sellOrderId,
                     tradeId: $match->tradeId,
                     executedPrice: $match->executedPrice,
                     executedAmount: $match->executedAmount,
                     makerFee: $match->makerFee,
-                    takerFee: $match->takerFee
+                    takerFee: $match->takerFee,
+                    metadata: ['maker_side' => $makerSide],
                 )->persist();
 
                 Order::retrieve($match->sellOrderId)->matchOrder(
@@ -131,7 +146,8 @@ class OrderMatchingWorkflow extends Workflow
                     executedPrice: $match->executedPrice,
                     executedAmount: $match->executedAmount,
                     makerFee: $match->makerFee,
-                    takerFee: $match->takerFee
+                    takerFee: $match->takerFee,
+                    metadata: ['maker_side' => $makerSide],
                 )->persist();
             } catch (Exception $e) {
                 // Log error and continue

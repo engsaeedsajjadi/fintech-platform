@@ -40,8 +40,19 @@ class ExchangeRateProviderServiceProvider extends ServiceProvider
     {
         $registry = app(ExchangeRateProviderRegistry::class);
 
-        // Register mock provider
-        if (config('exchange.providers.mock.enabled', true)) {
+        // Register mock provider.
+        //
+        // Phase 8: the mock provider returns RANDOM rates (rand() jitter
+        // around fixed tables) and the enhanced service stores whatever
+        // the registry returns as a real rate (provider label 'registry',
+        // not 'sandbox_mock'). Registering it in production meant money
+        // paths settled at invented prices. It is now registered only
+        // outside production, whatever the config flag says — the flag
+        // default is also env-gated in config/exchange.php, and the
+        // deploy preflight FAILs an explicit opt-in. With no real
+        // provider configured, getRate() throws and fetchAndStoreRate()
+        // returns null (fail-closed: "no rate available").
+        if (config('exchange.providers.mock.enabled', true) && ! app()->environment('production')) {
             $mockProvider = new MockExchangeRateProvider(config('exchange.providers.mock', []));
             $registry->register('mock', $mockProvider);
         }
@@ -70,9 +81,14 @@ class ExchangeRateProviderServiceProvider extends ServiceProvider
             }
         }
 
-        // Set default provider
+        // Set default provider. Phase 8: setDefault() throws when the named
+        // provider was never registered — in production the mock provider
+        // is not registered (see above), so a default of 'mock' must be
+        // skipped instead of crashing the boot.
         if ($default = config('exchange.default_provider')) {
-            $registry->setDefault($default);
+            if ($registry->has($default)) {
+                $registry->setDefault($default);
+            }
         }
 
         // Schedule rate refresh if enabled

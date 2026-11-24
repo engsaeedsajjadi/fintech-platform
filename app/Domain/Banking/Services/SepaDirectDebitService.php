@@ -57,7 +57,14 @@ class SepaDirectDebitService
             );
         }
 
-        if ($mandate->max_amount !== null && (float) $amount > (float) $mandate->max_amount) {
+        // Exact decimal comparison: (float) loses cents at the boundary.
+        // Both sides are normalized to canonical numeric strings first so
+        // bccomp never sees a non-numeric value.
+        $amountDecimal = \App\Support\DecimalString::fromNumeric($amount, 4) ?? '0.0000';
+        $maxDecimal = $mandate->max_amount !== null
+            ? (\App\Support\DecimalString::fromNumeric($mandate->max_amount, 4) ?? '0.0000')
+            : null;
+        if ($maxDecimal !== null && bccomp($amountDecimal, $maxDecimal, 4) === 1) {
             throw new RuntimeException(
                 "Collection amount [{$amount}] exceeds mandate max_amount [{$mandate->max_amount}]."
             );

@@ -71,8 +71,15 @@ class OrderProjector extends Projector
             'matched_order_id' => $event->matchedOrderId,
             'executed_price'   => $event->executedPrice,
             'executed_amount'  => $event->executedAmount,
-            'fee'              => $order->type === 'buy' ? $event->takerFee : $event->makerFee,
-            'timestamp'        => now()->toIso8601String(),
+            // The fee this order pays depends on its ROLE (maker/taker),
+            // not its side: a resting buy is the maker and pays the maker
+            // fee. The role rides in the event metadata (set by
+            // TradeSettlementService); fall back to the old side-based
+            // derivation only for events recorded before that existed.
+            'fee' => ($event->metadata['maker_side'] ?? ($order->type === 'buy' ? 'sell' : 'buy')) === $order->type
+                ? $event->makerFee
+                : $event->takerFee,
+            'timestamp' => now()->toIso8601String(),
         ];
 
         $filledAmount = BigDecimal::of($order->filled_amount)->plus($event->executedAmount);
@@ -105,6 +112,11 @@ class OrderProjector extends Projector
             return;
         }
 
+        // The maker side is the side that rested in the book, recorded in
+        // the event metadata by the settlement service — never derived
+        // from which order's event happens to be handled first.
+        $makerSide = $event->metadata['maker_side'] ?? ($order->type === 'buy' ? 'sell' : 'buy');
+
         Trade::create(
             [
             'trade_id'          => $event->tradeId,
@@ -119,7 +131,7 @@ class OrderProjector extends Projector
             'value'             => BigDecimal::of($event->executedPrice)->multipliedBy($event->executedAmount)->__toString(),
             'maker_fee'         => $event->makerFee,
             'taker_fee'         => $event->takerFee,
-            'maker_side'        => $order->type === 'buy' ? 'sell' : 'buy', // Maker is the opposite side
+            'maker_side'        => $makerSide,
             'metadata'          => $event->metadata,
             ]
         );

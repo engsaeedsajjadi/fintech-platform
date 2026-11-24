@@ -89,6 +89,12 @@ class BiometricVerificationService
 
     /**
      * Match faces between two images.
+     *
+     * Simulated — the old version returned a fabricated match
+     * (similarity 92.5, `is_match: true`, `confidence_level: high`) in
+     * the sandbox. A simulated face match must never pass, in any
+     * environment: same shape as the gate's fail-closed payload, plus
+     * the sandbox label.
      */
     public function matchFaces(string $image1Path, string $image2Path): array
     {
@@ -97,38 +103,14 @@ class BiometricVerificationService
             return $this->gate->failClosedFaceMatch();
         }
 
-        // In production, this would use facial recognition algorithms
-        // to compare facial features and calculate similarity
-
-        // Simulated face matching
-        $result = [
-            'faces_detected' => [
-                'image1' => true,
-                'image2' => true,
-            ],
-            'face_count' => [
-                'image1' => 1,
-                'image2' => 1,
-            ],
-            'similarity'       => 92.5, // Simulated similarity score
+        return array_merge([
+            'faces_detected'   => ['image1' => false, 'image2' => false],
+            'face_count'       => ['image1' => 0, 'image2' => 0],
+            'similarity'       => null,
             'match_threshold'  => 85.0,
-            'is_match'         => true,
-            'confidence_level' => 'high',
-        ];
-
-        // Add detailed comparison
-        $result['feature_comparison'] = [
-            'face_shape'       => 94.2,
-            'eye_distance'     => 91.8,
-            'nose_profile'     => 93.1,
-            'mouth_shape'      => 90.5,
-            'overall_geometry' => 92.5,
-        ];
-
-        $result['is_match'] = $result['similarity'] >= $result['match_threshold'];
-        $result['confidence_level'] = $this->getConfidenceLevel($result['similarity']);
-
-        return array_merge($result, $this->sandboxLabel());
+            'is_match'         => false,
+            'confidence_level' => 'very_low',
+        ], $this->sandboxLabel());
     }
 
     /**
@@ -234,6 +216,10 @@ class BiometricVerificationService
 
     /**
      * Compare against face template.
+     *
+     * Simulated — the old version returned a fabricated match
+     * (`is_match: true`, random similarity). A simulated comparison
+     * never matches, in any environment.
      */
     public function compareWithTemplate(string $imagePath, string $templateId): array
     {
@@ -247,14 +233,11 @@ class BiometricVerificationService
             ], $this->failClosedLabel());
         }
 
-        // In production, compare against stored template
-        // Simulated comparison
-
         return array_merge([
             'template_id'     => $templateId,
-            'similarity'      => rand(80, 98) / 100,
-            'is_match'        => true,
-            'comparison_time' => rand(50, 150), // milliseconds
+            'similarity'      => null,
+            'is_match'        => false,
+            'comparison_time' => null,
         ], $this->sandboxLabel());
     }
 

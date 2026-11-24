@@ -242,6 +242,62 @@ class OpsVerifyEnvCommand extends Command
         $this->requireFalse(self::CATEGORY_BYPASSES, 'regtech.demo_mode', 'REGTECH_DEMO_MODE resolves to true (config default is true) — regulatory filings/screening run in demo mode. Set REGTECH_DEMO_MODE=false explicitly.');
         $this->requireFalse(self::CATEGORY_BYPASSES, 'ai.demo_mode', 'AI_DEMO_MODE resolves to true (config default is true) — AI services return canned demo output. Set AI_DEMO_MODE=false explicitly.');
         $this->requireFalse(self::CATEGORY_BYPASSES, 'compliance-certification.soc2.demo_mode', 'SOC2_DEMO_MODE=true — the SOC 2 evidence endpoint returns fabricated audit data stamped as production (collectEvidence() also throws in prod). Set SOC2_DEMO_MODE=false.');
+
+        // Phase 8: explicit simulation opt-ins that the runtime gates do
+        // not (or did not) all refuse in production. Each of these FAILs
+        // the deploy while on, whatever the environment — the runtime
+        // gates (KycVerificationGate, DemoModeGuard, the asset-rate env
+        // guard) are the backstop, this is the front gate.
+        $this->requireFalse(self::CATEGORY_BYPASSES, 'asset.sandbox_rates_enabled', 'ASSET_SANDBOX_RATES_ENABLED=true — ExchangeRateService would serve hardcoded invented prices (BTC 42000, USD/EUR 0.85) labelled sandbox_mock on money paths. Set it to false in production.');
+        $this->requireFalse(self::CATEGORY_BYPASSES, 'exchange.providers.mock.enabled', 'EXCHANGE_MOCK_ENABLED=true — the mock exchange-rate provider returns RANDOM rates (rand() jitter) that the enhanced rate service stores as real rates. Set it to false in production and configure a real provider (Fixer.io / ExchangeRatesApi / Coinbase).');
+        $this->requireFalse(self::CATEGORY_BYPASSES, 'kyc.verification.simulated_providers_enabled', 'KYC_SIMULATED_PROVIDERS_ENABLED=true — simulated liveness/document/identity providers are enabled. KycVerificationGate refuses them in production, but an explicit opt-in must not ship. Set it to false in production.');
+        $this->requireFalse(self::CATEGORY_BYPASSES, 'payment_rails.simulation.enabled', 'PAYMENT_SIMULATION_ENABLED=true — simulated money paths (sandbox rail adapter, demo gateways) are enabled. DemoModeGuard refuses them in production, but an explicit opt-in must not ship. Set it to false in production.');
+
+        $this->checkCorsLocalOrigins();
+    }
+
+    /**
+     * Phase 8: CORS ships `supports_credentials: true` with localhost
+     * origins in the default list. A production deploy that forgets to
+     * clear CORS_LOCAL_ORIGINS would let any page served from a local dev
+     * server origin make credentialed cross-origin API calls. The config
+     * default is now empty outside local/testing/demo; this check blocks
+     * a deploy that still allows a localhost origin in production.
+     */
+    private function checkCorsLocalOrigins(): void
+    {
+        $origins = config('cors.allowed_origins');
+        $origins = is_array($origins) ? $origins : [];
+
+        $local = array_values(array_filter(
+            $origins,
+            static fn (mixed $origin): bool => is_string($origin)
+                && (str_starts_with($origin, 'http://localhost')
+                    || str_starts_with($origin, 'http://127.0.0.1')
+                    || str_starts_with($origin, 'http://[::1]')),
+        ));
+
+        $isProduction = $this->laravel->environment('production') || (bool) $this->option('strict');
+
+        if ($local === []) {
+            $this->add(self::CATEGORY_BYPASSES, 'cors.local_origins', self::PASS, 'No localhost origin is allowed with credentials.');
+
+            return;
+        }
+
+        if (! $isProduction) {
+            $this->add(self::CATEGORY_BYPASSES, 'cors.local_origins', self::WARN, sprintf(
+                'Localhost CORS origins are allowed (%s) — harmless outside production, but clear CORS_LOCAL_ORIGINS before deploying to production.',
+                implode(', ', $local),
+            ));
+
+            return;
+        }
+
+        $this->add(self::CATEGORY_BYPASSES, 'cors.local_origins', self::FAIL, sprintf(
+            'Localhost CORS origins are allowed in production (%s) while supports_credentials is true — a page on a local dev-server origin could make credentialed API calls. Set CORS_LOCAL_ORIGINS to an empty string in production.',
+            implode(', ', $local),
+        ));
     }
 
     private function checkBridgeWebhookCredentials(): void

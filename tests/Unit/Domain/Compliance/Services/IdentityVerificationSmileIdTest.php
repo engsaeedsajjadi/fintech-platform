@@ -37,28 +37,24 @@ describe('IdentityVerificationService – Smile ID', function () {
         expect($session['id_type'])->toBe('PASSPORT');
     });
 
-    it('returns result with expected shape', function () {
+    it('returns a fail-closed result shape, never a pass', function () {
         $result = $this->service->getVerificationResult('smileid', 'smileid_abc123');
 
-        expect($result['status'])->toBe('completed');
-        expect($result['confidence'])->toBeFloat();
-        expect($result['checks'])->toHaveKeys([
-            'document_validity',
-            'face_match',
-            'liveness_check',
-            'id_authority_check',
+        // A simulated result must never look like a verification: no
+        // passing status, no fabricated confidence, no invented identity.
+        expect($result['status'])->toBe('requires_manual_review');
+        expect($result['verified'])->toBeFalse();
+        expect($result['sandbox'])->toBeTrue();
+        expect($result['confidence'])->toBe(0.0);
+        expect($result['checks'])->toBe([
+            'document_validity'  => false,
+            'face_match'         => false,
+            'liveness_check'     => false,
+            'id_authority_check' => false,
         ]);
-        expect($result['extracted_data'])->toHaveKeys([
-            'first_name',
-            'last_name',
-            'date_of_birth',
-            'document_number',
-            'document_type',
-            'issuing_country',
-            'expiry_date',
-        ]);
-        expect($result['smile_job_id'])->toStartWith('sjid_');
-        expect($result)->toHaveKey('result_code');
+        expect($result)->not->toHaveKey('extracted_data');
+        expect($result['smile_job_id'])->toBeNull();
+        expect($result['result_code'])->toBeNull();
     });
 
     it('throws InvalidArgumentException for unknown provider', function () {

@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace App\Providers;
 
 use App\Domain\Account\Models\BlockchainAddress;
+use App\Domain\Compliance\Kyc\Contracts\IranianKycProviderInterface;
 use App\Domain\Compliance\Kyc\Listeners\SyncBridgeDevFeeOnTierChange;
 use App\Domain\Compliance\Kyc\Observers\BlockchainAddressBridgeObserver;
 use App\Domain\Compliance\Kyc\Providers\BridgeKycProvider;
 use App\Domain\Compliance\Kyc\Providers\OndatoKycProvider;
+use App\Domain\Compliance\Kyc\Providers\SandboxIranianKycProvider;
 use App\Domain\Compliance\Kyc\Registries\KycProviderRouter;
 use App\Domain\Compliance\Kyc\Services\BridgeDeveloperFeeSync;
 use App\Domain\Compliance\Services\OndatoService;
@@ -73,6 +75,15 @@ class KycServiceProvider extends ServiceProvider
                 routing: (array) config('kyc.routing', []),
             );
         });
+
+        // Iranian KYC: the sandbox adapter is the ONLY implementation
+        // until a real provider (civil registry / Shahkar / bank API) is
+        // contracted. It always returns requires_manual_review and throws
+        // outside a sandbox environment via KycVerificationGate.
+        $this->app->bind(
+            IranianKycProviderInterface::class,
+            SandboxIranianKycProvider::class
+        );
     }
 
     public function boot(): void

@@ -61,6 +61,14 @@ class IdentityVerificationService
 
     /**
      * Verify identity against external databases.
+     *
+     * There is no identity database behind this service — the Jumio /
+     * Onfido / SmileID branches are simulated. The old implementation
+     * fabricated a match for "John Doe" (confidence 95) and rolled a
+     * random credit-bureau hit, i.e. it could "verify" an arbitrary
+     * person. Both are removed: a simulated check finds no record, ever.
+     * The result stays labelled sandbox / requires_manual_review so the
+     * only path forward is human review.
      */
     public function verifyIdentity(array $data): array
     {
@@ -69,47 +77,23 @@ class IdentityVerificationService
             return $this->gate->failClosedIdentity();
         }
 
-        // In production, this would make actual API calls to identity verification services
-        // For demonstration, simulate the verification
+        // No identity database is consulted here — see checkIdentityDatabase().
+        $identityCheck = $this->checkIdentityDatabase($data);
+        $creditCheck = $this->checkCreditBureaus($data);
 
-        $results = [
+        return [
             'match_found'      => false,
             'match_confidence' => 0,
-            'sources_checked'  => [],
+            'sources_checked'  => ['National Identity Database', 'Credit Bureaus'],
             'discrepancies'    => [],
+            'identity_found'   => $identityCheck['found'],
+            'credit_found'     => $creditCheck['found'],
             'sandbox'          => true,
             'simulated'        => true,
             'verified'         => false,
             'status'           => 'requires_manual_review',
             'provider'         => 'sandbox',
         ];
-
-        // Simulate identity database check
-        $identityCheck = $this->checkIdentityDatabase($data);
-        $results['sources_checked'][] = 'National Identity Database';
-
-        if ($identityCheck['found']) {
-            $results['match_found'] = true;
-            $results['match_confidence'] = $identityCheck['confidence'];
-
-            // Check for discrepancies
-            $discrepancies = $this->findDiscrepancies($data, $identityCheck['data']);
-            if (! empty($discrepancies)) {
-                $results['discrepancies'] = $discrepancies;
-                $results['match_confidence'] -= count($discrepancies) * 10;
-            }
-        }
-
-        // Check against credit bureaus
-        $creditCheck = $this->checkCreditBureaus($data);
-        $results['sources_checked'][] = 'Credit Bureaus';
-
-        if ($creditCheck['found'] && ! $results['match_found']) {
-            $results['match_found'] = true;
-            $results['match_confidence'] = $creditCheck['confidence'] * 0.8; // Lower weight for credit bureau
-        }
-
-        return $results;
     }
 
     /**
@@ -166,41 +150,29 @@ class IdentityVerificationService
 
     /**
      * Check identity database (simulated).
+     *
+     * No identity database exists behind this service. The old version
+     * returned a fabricated "John Doe" record (confidence 95) for that
+     * name — a hardcoded identity that could be presented as a match.
+     * Removed: a simulated lookup never finds anyone.
      */
     protected function checkIdentityDatabase(array $data): array
     {
-        // Simulate database lookup
-        $firstName = strtolower($data['first_name'] ?? '');
-        $lastName = strtolower($data['last_name'] ?? '');
-        $dob = $data['date_of_birth'] ?? '';
-
-        // Simulate positive match for testing
-        if ($firstName === 'john' && $lastName === 'doe') {
-            return [
-                'found'      => true,
-                'confidence' => 95,
-                'data'       => [
-                    'first_name'    => 'John',
-                    'last_name'     => 'Doe',
-                    'date_of_birth' => $dob,
-                    'nationality'   => 'US',
-                    'id_number'     => 'ID123456789',
-                ],
-            ];
-        }
-
         return ['found' => false];
     }
 
     /**
      * Check credit bureaus (simulated).
+     *
+     * The old version rolled a random 70% "found" with a random
+     * confidence — non-deterministic fabricated evidence. Removed: a
+     * simulated check never finds a record.
      */
     protected function checkCreditBureaus(array $data): array
     {
-        // Simulate credit bureau check
         return [
-            'found'      => rand(0, 10) > 3, // 70% chance of finding record
-            'confidence' => rand(70, 90),
+            'found'      => false,
+            'confidence' => 0,
         ];
     }
 
@@ -258,64 +230,43 @@ class IdentityVerificationService
 
     /**
      * Get Jumio verification result.
+     *
+     * Simulated — the old version returned a fabricated "passed" result
+     * (confidence 92.5) with an invented identity (John Doe, passport
+     * P123456789). A simulated result must never look like a pass, so it
+     * now returns requires_manual_review with no extracted data: any
+     * caller that only checks `result` / `status` can no longer mistake
+     * it for a verification.
      */
     protected function getJumioResult(string $sessionId): array
     {
-        // In production, this would make actual API call
-        // Simulated response
         return array_merge([
-            'status'     => 'completed',
-            'result'     => 'passed',
-            'confidence' => 92.5,
+            'status'     => 'requires_manual_review',
+            'result'     => 'requires_manual_review',
+            'confidence' => 0.0,
             'checks'     => [
-                'document_validity' => true,
-                'face_match'        => true,
-                'data_extraction'   => true,
-                'fraud_check'       => true,
-            ],
-            'extracted_data' => [
-                'first_name'      => 'John',
-                'last_name'       => 'Doe',
-                'date_of_birth'   => '1990-01-01',
-                'document_number' => 'P123456789',
-                'document_type'   => 'passport',
-                'issuing_country' => 'US',
-                'expiry_date'     => '2025-12-31',
+                'document_validity' => false,
+                'face_match'        => false,
+                'data_extraction'   => false,
+                'fraud_check'       => false,
             ],
         ], $this->sandboxLabel());
     }
 
     /**
      * Get Onfido verification result.
+     *
+     * Simulated — the old version returned fabricated "clear" reports.
+     * Now requires_manual_review with no reports: a simulated result is
+     * never evidence.
      */
     protected function getOnfidoResult(string $sessionId): array
     {
-        // In production, this would make actual API call
-        // Simulated response
         return array_merge([
-            'status'     => 'complete',
-            'result'     => 'clear',
-            'sub_result' => 'clear',
-            'reports'    => [
-                [
-                    'name'      => 'document',
-                    'result'    => 'clear',
-                    'breakdown' => [
-                        'data_extraction'     => 'clear',
-                        'data_validation'     => 'clear',
-                        'image_integrity'     => 'clear',
-                        'visual_authenticity' => 'clear',
-                    ],
-                ],
-                [
-                    'name'      => 'facial_similarity_photo',
-                    'result'    => 'clear',
-                    'breakdown' => [
-                        'face_match'      => 'clear',
-                        'image_integrity' => 'clear',
-                    ],
-                ],
-            ],
+            'status'     => 'requires_manual_review',
+            'result'     => 'requires_manual_review',
+            'sub_result' => null,
+            'reports'    => [],
         ], $this->sandboxLabel());
     }
 
@@ -345,32 +296,25 @@ class IdentityVerificationService
     /**
      * Get Smile ID verification result.
      *
+     * Simulated — the old version returned a fabricated "completed"
+     * result (confidence 99.5) with an invented identity (Adebayo
+     * Ogunlesi). Now requires_manual_review with no extracted data.
+     *
      * @return array<string, mixed>
      */
     protected function getSmileIdResult(string $sessionId): array
     {
-        // In production, this would make actual API call to Smile ID
-        // Simulated response
         return array_merge([
-            'status'     => 'completed',
-            'confidence' => 99.5,
+            'status'     => 'requires_manual_review',
+            'confidence' => 0.0,
             'checks'     => [
-                'document_validity'  => true,
-                'face_match'         => true,
-                'liveness_check'     => true,
-                'id_authority_check' => true,
+                'document_validity'  => false,
+                'face_match'         => false,
+                'liveness_check'     => false,
+                'id_authority_check' => false,
             ],
-            'extracted_data' => [
-                'first_name'      => 'Adebayo',
-                'last_name'       => 'Ogunlesi',
-                'date_of_birth'   => '1985-03-15',
-                'document_number' => 'A00000000',
-                'document_type'   => 'national_id',
-                'issuing_country' => 'NG',
-                'expiry_date'     => '2030-12-31',
-            ],
-            'smile_job_id' => 'sjid_' . uniqid(),
-            'result_code'  => '1012',
+            'smile_job_id' => null,
+            'result_code'  => null,
         ], $this->sandboxLabel());
     }
 

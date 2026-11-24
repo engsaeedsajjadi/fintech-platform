@@ -10,9 +10,11 @@ use App\Domain\Banking\Exceptions\BankConnectionException;
 use App\Domain\Banking\Exceptions\BankNotFoundException;
 use App\Domain\Banking\Models\BankAccount;
 use App\Domain\Banking\Models\BankAccountModel;
+use App\Domain\Banking\Models\BankBalance;
 use App\Domain\Banking\Models\BankConnection;
 use App\Domain\Banking\Models\BankConnectionModel;
 use App\Domain\Banking\Models\BankTransfer;
+use App\Domain\Ledger\ValueObjects\DecimalMath;
 use App\Models\User;
 use App\Support\DecimalString;
 use Exception;
@@ -75,18 +77,37 @@ class BankIntegrationService implements IBankIntegrationService
 
     /**
      * {@inheritDoc}
+     *
+     * Network first, persistence second: the provider is authenticated
+     * OUTSIDE any DB transaction (a network call inside a transaction
+     * holds row locks while waiting on the network). The connection row
+     * is then written in its own short transaction, and the initial
+     * account sync runs AFTER the commit — it is network I/O and is
+     * retryable on its own, so a sync failure is logged and the (real)
+     * connection is kept instead of rolling it back.
      */
     public function connectUserToBank(User $user, string $bankCode, array $credentials): BankConnection
     {
         $connector = $this->getConnector($bankCode);
 
-        DB::beginTransaction();
+        // 1. Network: authenticate outside any transaction.
         try {
-            // Validate credentials with bank
             $connector->authenticate();
+        } catch (Exception $e) {
+            Log::error(
+                'Failed to connect user to bank',
+                [
+                    'user_id'   => $user->uuid,
+                    'bank_code' => $bankCode,
+                    'error'     => $e->getMessage(),
+                ]
+            );
+            throw new BankConnectionException("Failed to connect to {$bankCode}: " . $e->getMessage(), previous: $e);
+        }
 
-            // Store encrypted connection
-            $connectionModel = BankConnectionModel::create(
+        // 2. Local only: store the encrypted connection.
+        $connectionModel = DB::transaction(
+            fn () => BankConnectionModel::create(
                 [
                     'id'           => Str::uuid()->toString(),
                     'user_uuid'    => $user->uuid,
@@ -101,26 +122,26 @@ class BankIntegrationService implements IBankIntegrationService
                         'connected_at' => now()->toIso8601String(),
                     ],
                 ]
-            );
+            )
+        );
 
-            // Initial account sync
+        // 3. Network again, after the commit: initial account sync.
+        try {
             $this->syncBankAccounts($user, $bankCode);
-
-            DB::commit();
-
-            return BankConnection::fromArray($connectionModel->toArray());
         } catch (Exception $e) {
-            DB::rollBack();
-            Log::error(
-                'Failed to connect user to bank',
+            Log::warning(
+                'Initial bank account sync failed after connect; connection kept, sync is retryable',
                 [
                     'user_id'   => $user->uuid,
                     'bank_code' => $bankCode,
                     'error'     => $e->getMessage(),
                 ]
             );
-            throw new BankConnectionException("Failed to connect to {$bankCode}: " . $e->getMessage());
         }
+
+        $fresh = $connectionModel->fresh();
+
+        return BankConnection::fromArray(($fresh ?? $connectionModel)->toArray());
     }
 
     /**
@@ -170,46 +191,46 @@ class BankIntegrationService implements IBankIntegrationService
 
     /**
      * {@inheritDoc}
+     *
+     * The provider account is created FIRST (network, outside any
+     * transaction); only the local row is written transactionally.
+     * The account number / IBAN come from the provider response only.
      */
     public function createBankAccount(User $user, string $bankCode, array $accountDetails): BankAccount
     {
         $connector = $this->getConnector($bankCode);
 
-        // Verify user has active connection
-        $connection = BankConnectionModel::where('user_uuid', $user->uuid)
+        // Verify user has active connection (existence check only).
+        BankConnectionModel::where('user_uuid', $user->uuid)
             ->where('bank_code', $bankCode)
             ->where('status', 'active')
             ->firstOrFail();
 
-        DB::beginTransaction();
-        try {
-            // Create account with bank
-            $bankAccount = $connector->createAccount($accountDetails);
+        // Network outside the transaction.
+        $bankAccount = $connector->createAccount($accountDetails);
 
-            // Store in database
-            $accountModel = BankAccountModel::create(
-                [
-                    'id'             => Str::uuid()->toString(),
-                    'user_uuid'      => $user->uuid,
-                    'bank_code'      => $bankCode,
-                    'external_id'    => $bankAccount->id,
-                    'account_number' => encrypt($bankAccount->accountNumber),
-                    'iban'           => encrypt($bankAccount->iban),
-                    'swift'          => $bankAccount->swift,
-                    'currency'       => $bankAccount->currency,
-                    'account_type'   => $bankAccount->accountType,
-                    'status'         => 'active',
-                    'metadata'       => $bankAccount->metadata,
-                ]
-            );
+        // Local only, inside a short transaction.
+        DB::transaction(
+            function () use ($user, $bankCode, $bankAccount) {
+                BankAccountModel::create(
+                    [
+                        'id'             => Str::uuid()->toString(),
+                        'user_uuid'      => $user->uuid,
+                        'bank_code'      => $bankCode,
+                        'external_id'    => $bankAccount->id,
+                        'account_number' => encrypt($bankAccount->accountNumber),
+                        'iban'           => encrypt($bankAccount->iban),
+                        'swift'          => $bankAccount->swift,
+                        'currency'       => $bankAccount->currency,
+                        'account_type'   => $bankAccount->accountType,
+                        'status'         => 'active',
+                        'metadata'       => $bankAccount->metadata,
+                    ]
+                );
+            }
+        );
 
-            DB::commit();
-
-            return $bankAccount;
-        } catch (Exception $e) {
-            DB::rollBack();
-            throw $e;
-        }
+        return $bankAccount;
     }
 
     /**
@@ -231,13 +252,13 @@ class BankIntegrationService implements IBankIntegrationService
                     bankCode: $model->bank_code,
                     accountNumber: decrypt($model->account_number),
                     iban: decrypt($model->iban),
-                    swift: $model->swift,
+                    swift: (string) ($model->swift ?? ''),
                     currency: $model->currency,
                     accountType: $model->account_type,
                     status: $model->status,
-                    holderName: $model->metadata['holder_name'] ?? null,
-                    holderAddress: $model->metadata['holder_address'] ?? null,
-                    metadata: $model->metadata,
+                    holderName: ($model->metadata ?? [])['holder_name'] ?? null,
+                    holderAddress: ($model->metadata ?? [])['holder_address'] ?? null,
+                    metadata: $model->metadata ?? [],
                     createdAt: $model->created_at,
                     updatedAt: $model->updated_at,
                     closedAt: null
@@ -331,6 +352,10 @@ class BankIntegrationService implements IBankIntegrationService
 
     /**
      * {@inheritDoc}
+     *
+     * Legacy float boundary: the float is converted to an exact decimal
+     * string immediately and the exact implementation runs. New callers
+     * must use {@see initiateInterBankTransferExact()}.
      */
     public function initiateInterBankTransfer(
         User $user,
@@ -342,83 +367,163 @@ class BankIntegrationService implements IBankIntegrationService
         string $currency,
         array $metadata = []
     ): BankTransfer {
-        // Get connectors
-        $fromConnector = $this->getConnector($fromBankCode);
-        $toConnector = $this->getConnector($toBankCode);
+        $decimalAmount = DecimalString::fromNumeric($amount, 4) ?? '0.0000';
 
-        // Verify accounts belong to user
-        $fromAccount = BankAccountModel::where('user_uuid', $user->uuid)
+        return $this->initiateInterBankTransferExact(
+            $user,
+            $fromBankCode,
+            $fromAccountId,
+            $toBankCode,
+            $toAccountId,
+            $decimalAmount,
+            $currency,
+            $metadata,
+        );
+    }
+
+    /**
+     * Exact-amount inter-bank transfer.
+     *
+     * Order of operations (never a network call inside a DB transaction):
+     *   1. local account lookup,
+     *   2. provider balance check + provider transfer (network, outside
+     *      any transaction; an unclear provider outcome is the
+     *      connector's explicit failure/unknown, never a local guess),
+     *   3. only the local transfer record is written transactionally.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
+     */
+    public function initiateInterBankTransferExact(
+        User $user,
+        string $fromBankCode,
+        string $fromAccountId,
+        string $toBankCode,
+        string $toAccountId,
+        string $amount,
+        string $currency,
+        array $metadata = []
+    ): BankTransfer {
+        // Canonicalize the amount once, at the boundary: every downstream
+        // consumer (provider, local record, returned transfer) sees the
+        // same exact 4-decimal string, never '10.10' vs '10.1000' drift.
+        $amount = DecimalString::fromNumeric($amount, 4)
+            ?? throw new BankConnectionException("Invalid transfer amount: {$amount}");
+
+        // Both connectors must exist before any money moves.
+        $fromConnector = $this->getConnector($fromBankCode);
+        $this->getConnector($toBankCode);
+
+        // Verify accounts belong to user (existence check only).
+        BankAccountModel::where('user_uuid', $user->uuid)
             ->where('bank_code', $fromBankCode)
             ->where('external_id', $fromAccountId)
             ->where('status', 'active')
             ->firstOrFail();
 
-        DB::beginTransaction();
-        try {
-            // Normalise the float boundary amount to an exact decimal
-            // string immediately: no float arithmetic runs downstream.
-            $decimalAmount = DecimalString::fromNumeric($amount, 4) ?? '0.0000';
-
-            // Check balance
-            $balance = $fromConnector->getBalance($fromAccountId, $currency);
-            if (! $balance->hasSufficientFunds($decimalAmount)) {
-                throw new Exception('Insufficient funds');
-            }
-
-            // Determine transfer type
-            $transferType = $this->routingService->determineTransferType(
-                $fromBankCode,
-                $toBankCode,
-                $currency,
-                $amount
-            );
-
-            // Initiate transfer
-            $transfer = $fromConnector->initiateTransfer(
-                [
-                    'from_account_id' => $fromAccountId,
-                    'to_account_id'   => $toAccountId,
-                    'to_bank_code'    => $toBankCode,
-                    'amount'          => $decimalAmount,
-                    'currency'        => $currency,
-                    'type'            => $transferType,
-                    'reference'       => $metadata['reference'] ?? Str::random(16),
-                    'description'     => $metadata['description'] ?? null,
-                ]
-            );
-
-            // Store transfer record
-            DB::table('bank_transfers')->insert(
-                [
-                    'id'              => $transfer->id,
-                    'user_uuid'       => $user->uuid,
-                    'from_bank_code'  => $fromBankCode,
-                    'from_account_id' => $fromAccountId,
-                    'to_bank_code'    => $toBankCode,
-                    'to_account_id'   => $toAccountId,
-                    'amount'          => $decimalAmount,
-                    'currency'        => $currency,
-                    'type'            => $transferType,
-                    'status'          => $transfer->status,
-                    'metadata'        => json_encode($transfer->metadata),
-                    'created_at'      => now(),
-                    'updated_at'      => now(),
-                ]
-            );
-
-            DB::commit();
-
-            return $transfer;
-        } catch (Exception $e) {
-            DB::rollBack();
-            throw $e;
+        // Network, outside any transaction.
+        $balance = $fromConnector->getBalance($fromAccountId, $currency);
+        if (! $balance instanceof BankBalance) {
+            throw new BankConnectionException("Balance check for {$fromAccountId} did not return a single balance.");
         }
+        if (! $balance->hasSufficientFunds($amount)) {
+            throw new Exception('Insufficient funds');
+        }
+
+        // Determine transfer type
+        $transferType = $this->routingService->determineTransferType(
+            $fromBankCode,
+            $toBankCode,
+            $currency,
+            $amount
+        );
+
+        // Initiate transfer with the provider.
+        $transfer = $fromConnector->initiateTransfer(
+            [
+                'from_account_id' => $fromAccountId,
+                'to_account_id'   => $toAccountId,
+                'to_bank_code'    => $toBankCode,
+                'amount'          => $amount,
+                'currency'        => $currency,
+                'type'            => $transferType,
+                'reference'       => $metadata['reference'] ?? Str::random(16),
+                'description'     => $metadata['description'] ?? null,
+            ]
+        );
+
+        // The provider echoes its own amount spelling; normalize the
+        // returned transfer to the canonical amount so callers never see
+        // a different representation of the same value.
+        if ($transfer->amount !== $amount) {
+            $transfer = new BankTransfer(
+                id: $transfer->id,
+                bankCode: $transfer->bankCode,
+                type: $transfer->type,
+                status: $transfer->status,
+                fromAccountId: $transfer->fromAccountId,
+                toAccountId: $transfer->toAccountId,
+                toBankCode: $transfer->toBankCode,
+                amount: $amount,
+                currency: $transfer->currency,
+                reference: $transfer->reference,
+                description: $transfer->description,
+                fees: $transfer->fees,
+                exchangeRate: $transfer->exchangeRate,
+                createdAt: $transfer->createdAt,
+                updatedAt: $transfer->updatedAt,
+                executedAt: $transfer->executedAt,
+                failedAt: $transfer->failedAt,
+                failureReason: $transfer->failureReason,
+                metadata: $transfer->metadata,
+            );
+        }
+
+        // Local record only, inside a short transaction.
+        DB::transaction(
+            function () use ($user, $transfer, $fromBankCode, $fromAccountId, $toBankCode, $toAccountId, $amount, $currency, $transferType) {
+                DB::table('bank_transfers')->insert(
+                    [
+                        'id'              => $transfer->id,
+                        'user_uuid'       => $user->uuid,
+                        'from_bank_code'  => $fromBankCode,
+                        'from_account_id' => $fromAccountId,
+                        'to_bank_code'    => $toBankCode,
+                        'to_account_id'   => $toAccountId,
+                        'amount'          => $amount,
+                        'currency'        => $currency,
+                        'type'            => $transferType,
+                        'status'          => $transfer->status,
+                        'metadata'        => json_encode($transfer->metadata),
+                        'created_at'      => now(),
+                        'updated_at'      => now(),
+                    ]
+                );
+            }
+        );
+
+        return $transfer;
     }
 
     /**
      * {@inheritDoc}
+     *
+     * Legacy float API for existing callers (GraphQL/REST). The float is
+     * lossy by nature — new callers must use
+     * {@see getAggregatedBalanceExact()}.
      */
     public function getOptimalBank(User $user, string $currency, float $amount, string $transferType): string
+    {
+        $decimalAmount = DecimalString::fromNumeric($amount, 4) ?? '0.0000';
+
+        return $this->getOptimalBankExact($user, $currency, $decimalAmount, $transferType);
+    }
+
+    /**
+     * Exact-amount optimal-bank selection.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
+     */
+    public function getOptimalBankExact(User $user, string $currency, string $amount, string $transferType): string
     {
         return $this->routingService->getOptimalBank(
             $user,
@@ -439,16 +544,30 @@ class BankIntegrationService implements IBankIntegrationService
 
     /**
      * {@inheritDoc}
+     *
+     * Legacy float API for existing callers (GraphQL/REST). The float is
+     * lossy by nature — new callers must use
+     * {@see getAggregatedBalanceExact()}.
      */
     public function getAggregatedBalance(User $user, string $currency): float
     {
+        return (float) $this->getAggregatedBalanceExact($user, $currency);
+    }
+
+    /**
+     * Exact aggregated balance across all of the user's banks, as a
+     * decimal string in major units. Balances are summed with bcmath —
+     * 0.10 + 0.20 is 0.3000, never a float artefact.
+     */
+    public function getAggregatedBalanceExact(User $user, string $currency): string
+    {
         $cacheKey = "user_balance:{$user->uuid}:{$currency}";
 
-        return Cache::remember(
+        $total = Cache::remember(
             $cacheKey,
             300,
             function () use ($user, $currency) {
-                $totalBalance = 0;
+                $totalBalance = '0.0000';
 
                 $connections = $this->getUserBankConnections($user);
 
@@ -464,7 +583,9 @@ class BankIntegrationService implements IBankIntegrationService
                         foreach ($accounts as $account) {
                             if ($account->supportsCurrency($currency)) {
                                 $balance = $connector->getBalance($account->id, $currency);
-                                $totalBalance += $balance->available;
+                                if ($balance instanceof BankBalance) {
+                                    $totalBalance = DecimalMath::add($totalBalance, $balance->available, 4);
+                                }
                             }
                         }
                     } catch (Exception $e) {
@@ -481,5 +602,7 @@ class BankIntegrationService implements IBankIntegrationService
                 return $totalBalance;
             }
         );
+
+        return (string) $total;
     }
 }

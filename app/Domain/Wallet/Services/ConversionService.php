@@ -9,7 +9,9 @@ use App\Domain\Account\DataObjects\Money;
 use App\Domain\Account\Models\AccountBalance;
 use App\Domain\Asset\Aggregates\AssetTransferAggregate;
 use App\Domain\Asset\Models\Asset;
+use App\Domain\Asset\ValueObjects\CurrencyPrecisionRegistry;
 use App\Domain\Exchange\Exceptions\RateProviderException;
+use App\Domain\Exchange\Providers\MockExchangeRateProvider;
 use App\Domain\Exchange\Services\ExchangeRateProviderRegistry;
 use App\Domain\Ledger\Enums\AccountType;
 use App\Domain\Ledger\Models\LedgerAccount;
@@ -24,6 +26,7 @@ use App\Domain\Wallet\Models\ConversionQuote;
 use Brick\Math\BigDecimal;
 use Brick\Math\RoundingMode;
 use Carbon\Carbon;
+use Exception;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
@@ -90,7 +93,7 @@ final class ConversionService
             18,
         );
         $net = (string) BigDecimal::of($amount)->minus(BigDecimal::of($fee))->toScale(18, RoundingMode::DOWN);
-        $converted = (string) BigDecimal::of($net)->multipliedBy(BigDecimal::of($rate))->toScale(18, RoundingMode::DOWN);
+        $converted = (string) BigDecimal::of($net)->multipliedBy(BigDecimal::of($rate['rate']))->toScale(18, RoundingMode::DOWN);
         if (BigDecimal::of($converted)->isLessThanOrEqualTo(BigDecimal::zero())) {
             throw new InvalidArgumentException('The amount is too small to convert after fees.');
         }
@@ -101,10 +104,10 @@ final class ConversionService
             'from_asset'       => $fromAsset,
             'to_asset'         => $toAsset,
             'amount'           => DecimalMath::scale18($amount),
-            'rate'             => $rate,
+            'rate'             => $rate['rate'],
             'fee'              => DecimalMath::scale18($fee),
             'converted_amount' => $converted,
-            'provider'         => (string) config('exchange.default_provider', 'mock'),
+            'provider'         => $rate['provider'],
             'status'           => ConversionQuote::STATUS_ACTIVE,
             'expires_at'       => Carbon::now()->addSeconds((int) config('wallet.conversion.ttl_seconds', 60)),
         ]);
@@ -347,25 +350,72 @@ final class ConversionService
     // Internals
     // ------------------------------------------------------------------
 
-    /** @return numeric-string exact decimal rate, scale 10 */
-    private function fetchRate(string $from, string $to): string
+    /**
+     * Fetch a rate from the first available provider that supports the
+     * pair (highest registry priority first), and report WHICH provider
+     * served it. The old code stored config('exchange.default_provider')
+     * on the quote regardless of who actually served the rate — a quote
+     * priced by the mock provider was labelled as if a real provider had
+     * priced it.
+     *
+     * Fail-closed on sandbox rates: when the serving provider is a mock /
+     * sandbox provider and config('wallet.conversion.allow_sandbox_provider')
+     * is off (production default), no quote is created at all. A
+     * sandbox-priced quote is labelled `<provider>:sandbox` on the quote.
+     *
+     * @return array{rate: numeric-string, provider: string}
+     */
+    private function fetchRate(string $from, string $to): array
     {
-        try {
-            $rate = $this->rateRegistry->getRate($from, $to);
-        } catch (RateProviderException $e) {
-            throw new RateUnavailableException($from, $to, "No exchange rate is available for {$from} to {$to}: {$e->getMessage()}");
+        $lastError = null;
+        foreach ($this->rateRegistry->byPriority() as $name => $provider) {
+            try {
+                if (! $provider->isAvailable() || ! $provider->supportsPair($from, $to)) {
+                    continue;
+                }
+                $quote = $provider->getRate($from, $to);
+            } catch (Exception $e) {
+                $lastError = $e;
+
+                continue;
+            }
+
+            $decimal = $quote instanceof BigDecimal ? $quote : BigDecimal::of((string) $quote->rate);
+            if ($decimal->isLessThanOrEqualTo(BigDecimal::zero())) {
+                throw new RateUnavailableException($from, $to, "Rate provider '{$name}' returned a non-positive rate for {$from} to {$to}.");
+            }
+
+            $providerName = (string) $name;
+            if ($this->isSandboxProvider($providerName, $provider)) {
+                if (! (bool) config('wallet.conversion.allow_sandbox_provider', false)) {
+                    throw new RateUnavailableException($from, $to, "Only a sandbox/mock rate provider is available for {$from} to {$to}, and sandbox pricing is disabled (wallet.conversion.allow_sandbox_provider). No rate was invented.");
+                }
+                $providerName .= ':sandbox';
+            }
+
+            /** @var numeric-string $rateString */
+            $rateString = (string) $decimal->toScale(10, RoundingMode::DOWN);
+
+            return [
+                'rate'     => $rateString,
+                'provider' => $providerName,
+            ];
         }
 
-        if ($rate === null) {
-            throw new RateUnavailableException($from, $to);
+        if ($lastError instanceof RateProviderException) {
+            throw new RateUnavailableException($from, $to, "No exchange rate is available for {$from} to {$to}: {$lastError->getMessage()}");
         }
 
-        $decimal = $rate instanceof BigDecimal ? $rate : BigDecimal::of((string) $rate);
-        if ($decimal->isLessThanOrEqualTo(BigDecimal::zero())) {
-            throw new RateUnavailableException($from, $to, "Rate provider returned a non-positive rate for {$from} to {$to}.");
+        throw new RateUnavailableException($from, $to);
+    }
+
+    private function isSandboxProvider(string $name, mixed $provider): bool
+    {
+        if (str_contains(strtolower($name), 'mock')) {
+            return true;
         }
 
-        return (string) $decimal->toScale(10, RoundingMode::DOWN);
+        return $provider instanceof MockExchangeRateProvider;
     }
 
     private function isFiat(string $asset): bool
@@ -393,9 +443,20 @@ final class ConversionService
         throw new InvalidAssetException("Asset {$asset} is not a known fiat currency, digital asset, or registered Asset.");
     }
 
+    /**
+     * Precision of an asset: the registered `assets` row first, then the
+     * canonical currency registry (LedgerPrecision-backed). The old
+     * hardcoded fallback of 8 mis-scaled every unregistered asset (e.g.
+     * USDT at 8 instead of 6 — a 100x minor-unit error on conversion).
+     */
     private function precisionOf(string $assetCode): int
     {
-        return (int) (Asset::query()->where('code', strtoupper($assetCode))->value('precision') ?? 8);
+        $row = Asset::query()->where('code', strtoupper($assetCode))->value('precision');
+        if ($row !== null) {
+            return (int) $row;
+        }
+
+        return CurrencyPrecisionRegistry::for($assetCode)->minorUnitExponent;
     }
 
     private function ensureLedgerAccount(string $code, string $name, AccountType $type, string $currency): void

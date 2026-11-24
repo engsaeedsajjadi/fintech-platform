@@ -28,6 +28,59 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Registered-account enforcement (Phase 4.2-B)
+    |--------------------------------------------------------------------------
+    |
+    | When true, LedgerService refuses lines whose account code has no row
+    | in the chart of accounts. Default false: trading virtual accounts
+    | (`trading:account:{id}:{ccy}`, `trading:fees:{ccy}`) are not chart
+    | rows — Exchange posts to them directly — so turning this on requires
+    | registering those accounts first. An account that DOES exist in the
+    | chart must always be active, regardless of this flag.
+    |
+    */
+    'require_registered_accounts' => (bool) env('LEDGER_REQUIRE_REGISTERED_ACCOUNTS', false),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Idempotency claim TTL (Phase 4.2-C)
+    |--------------------------------------------------------------------------
+    |
+    | Seconds after which a claim with no journal entry attached is treated
+    | as stale (its process crashed before the entry commit) and may be
+    | reclaimed by the next caller instead of blocking the key forever.
+    |
+    */
+    'idempotency_claim_ttl_seconds' => (int) env('LEDGER_IDEMPOTENCY_CLAIM_TTL', 120),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Currency / asset precision model (Phase 4.2-F)
+    |--------------------------------------------------------------------------
+    |
+    | The ledger posts at `posting_scale` (4). Fiat needs at most 3 decimals
+    | (ISO-4217 minor units), so fiat amounts only lose sub-0.0001 dust.
+    | Digital assets need more (BTC/ETH 8, SOL 9, USDT/USDC 6): amounts
+    | that need more decimals than the posting scale are REFUSED, never
+    | truncated. `crypto` maps asset code => native scale; unknown codes are
+    | refused above the posting scale as well. See
+    | App\Domain\Ledger\ValueObjects\LedgerPrecision.
+    |
+    */
+    'precision' => [
+        'crypto' => [
+            'BTC'  => 8,
+            'ETH'  => 8,
+            'SOL'  => 9,
+            'USDT' => 6,
+            'USDC' => 6,
+            'DAI'  => 6,
+            'GCU'  => 4,
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Direct ledger funding (demo feature)
     |--------------------------------------------------------------------------
     |

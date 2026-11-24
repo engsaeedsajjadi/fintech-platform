@@ -23,6 +23,13 @@ interface IranianRailAdapterInterface
 {
     public function getRail(): IranianPaymentRail;
 
+    /**
+     * True only when BOTH gates hold: this rail is enabled in config
+     * (payment_rails.<rail>.enabled) AND sandbox simulation is allowed
+     * (local/testing/demo with simulation explicitly enabled). The two
+     * gates are independent — a disabled rail is unavailable even when
+     * simulation is on.
+     */
     public function isAvailable(): bool;
 
     /**
@@ -30,8 +37,8 @@ interface IranianRailAdapterInterface
      *
      * @throws RuntimeException when the rail is disabled, when simulation
      *         is not allowed (production), or when the idempotency key was
-     *         already used (the original row is returned instead — see
-     *         initiateTransferIdempotent()).
+     *         already used (use initiateTransferIdempotent() to replay
+     *         the original row instead).
      */
     public function initiateTransfer(int $amountMinor, string $idempotencyKey): IranianRailTransfer;
 

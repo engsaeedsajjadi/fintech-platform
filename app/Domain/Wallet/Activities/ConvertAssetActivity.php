@@ -10,6 +10,7 @@ use App\Domain\Account\Models\AccountBalance;
 use App\Domain\Asset\Aggregates\AssetTransferAggregate;
 use App\Domain\Asset\Models\Asset;
 use App\Domain\Asset\Models\ExchangeRate;
+use App\Domain\Asset\ValueObjects\CurrencyPrecisionRegistry;
 use Exception;
 use InvalidArgumentException;
 use Workflow\Activity;
@@ -121,9 +122,20 @@ class ConvertAssetActivity extends Activity
         return (int) bcmul($converted, bcpow('10', (string) $this->precisionOf($toAssetCode)), 0);
     }
 
+    /**
+     * Precision of an asset: the registered `assets` row first, then the
+     * canonical currency registry (LedgerPrecision-backed). The old
+     * hardcoded fallback of 2 silently mis-scaled every unregistered
+     * asset (e.g. BTC at 2 instead of 8).
+     */
     private function precisionOf(string $assetCode): int
     {
-        return (int) (Asset::query()->where('code', $assetCode)->value('precision') ?? 2);
+        $row = Asset::query()->where('code', $assetCode)->value('precision');
+        if ($row !== null) {
+            return (int) $row;
+        }
+
+        return CurrencyPrecisionRegistry::for($assetCode)->minorUnitExponent;
     }
 
     /**

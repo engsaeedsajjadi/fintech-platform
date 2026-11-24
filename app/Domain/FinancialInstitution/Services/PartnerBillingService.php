@@ -193,26 +193,57 @@ class PartnerBillingService
 
     /**
      * Get total outstanding balance for a partner.
+     *
+     * Legacy float API — the DB sum is converted at the boundary and is
+     * lossy by nature. New callers must use getOutstandingBalanceExact().
      */
     public function getOutstandingBalance(FinancialInstitutionPartner $partner): float
     {
-        return (float) PartnerInvoice::where('partner_id', $partner->id)
+        return (float) $this->getOutstandingBalanceExact($partner);
+    }
+
+    /**
+     * Exact total outstanding balance, as a decimal string in major
+     * units. The DB sum is normalized with bcmath, never (float).
+     */
+    public function getOutstandingBalanceExact(FinancialInstitutionPartner $partner): string
+    {
+        $sum = PartnerInvoice::where('partner_id', $partner->id)
             ->pending()
             ->sum('total_amount_usd');
+
+        return \App\Support\DecimalString::fromNumeric($sum, 4) ?? '0.0000';
     }
 
     /**
      * Calculate billing cycle discount amount.
+     *
+     * Legacy float API — computed exactly and converted at the boundary.
+     * New callers must use applyBillingCycleDiscountExact().
      */
     public function applyBillingCycleDiscount(float $baseAmount, string $billingCycle): float
     {
-        $discountPercentage = match ($billingCycle) {
-            'quarterly' => (float) config('baas.billing.quarterly_discount_percentage', 5),
-            'annually'  => (float) config('baas.billing.annual_discount_percentage', 15),
-            default     => 0.0,
-        };
+        return (float) $this->applyBillingCycleDiscountExact(
+            \App\Support\DecimalString::fromNumeric($baseAmount, 4) ?? '0.0000',
+            $billingCycle,
+        );
+    }
 
-        return round($baseAmount * ($discountPercentage / 100), 2);
+    /**
+     * Exact billing-cycle discount amount, as a decimal string in major
+     * units (bcmath throughout, never float multiplication).
+     *
+     * @param numeric-string $baseAmount
+     */
+    public function applyBillingCycleDiscountExact(string $baseAmount, string $billingCycle): string
+    {
+        $discountPercentage = \App\Support\DecimalString::fromNumeric(match ($billingCycle) {
+            'quarterly' => config('baas.billing.quarterly_discount_percentage', 5),
+            'annually'  => config('baas.billing.annual_discount_percentage', 15),
+            default     => 0,
+        }, 4) ?? '0.0000';
+
+        return bcdiv(bcmul($baseAmount, $discountPercentage, 4), '100', 2);
     }
 
     /**

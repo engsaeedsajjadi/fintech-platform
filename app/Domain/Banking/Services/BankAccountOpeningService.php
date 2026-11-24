@@ -13,6 +13,7 @@ use App\Domain\Banking\Models\BankStatement;
 use App\Domain\Banking\Models\ExternalBankAccountApplication;
 use App\Domain\Compliance\Services\KycService;
 use App\Models\User;
+use DateTime;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -99,7 +100,10 @@ class BankAccountOpeningService
         $application->save();
 
         Event::dispatch(new \App\Domain\Banking\Events\BankAccountOpeningRequested(
-            (string) $application->id, (string) $user->uuid, $providerName, $idempotencyKey,
+            (string) $application->id,
+            (string) $user->uuid,
+            $providerName,
+            $idempotencyKey,
         ));
 
         $providerDetails = array_merge($details, [
@@ -118,22 +122,26 @@ class BankAccountOpeningService
             $application->save();
 
             Event::dispatch(new \App\Domain\Banking\Events\BankAccountOpeningRejected(
-                (string) $application->id, (string) $user->uuid, $e->getMessage(),
+                (string) $application->id,
+                (string) $user->uuid,
+                $e->getMessage(),
             ));
 
             throw new AccountOpeningException("Bank rejected the application: {$e->getMessage()}", previous: $e);
         } catch (Throwable $e) {
             // Timeout / ambiguous outcome: unknown, not failed. Manual review.
             $application->status = ExternalBankAccountApplication::STATUS_REQUIRES_MANUAL_REVIEW;
-            $application->rejection_reason = 'Unknown provider outcome: '.$e->getMessage();
+            $application->rejection_reason = 'Unknown provider outcome: ' . $e->getMessage();
             $application->save();
 
             Event::dispatch(new \App\Domain\Banking\Events\BankAccountOpeningRequiresManualReview(
-                (string) $application->id, (string) $user->uuid, $e->getMessage(),
+                (string) $application->id,
+                (string) $user->uuid,
+                $e->getMessage(),
             ));
 
             throw new AccountOpeningException(
-                "Bank account opening outcome is unknown (provider error) — application is held for manual review.",
+                'Bank account opening outcome is unknown (provider error) — application is held for manual review.',
                 previous: $e,
             );
         }
@@ -176,7 +184,9 @@ class BankAccountOpeningService
         $application->save();
 
         Event::dispatch(new \App\Domain\Banking\Events\BankAccountOpeningRequiresManualReview(
-            (string) $application->id, (string) $user->uuid, "Provider status: {$bankAccount->status}.",
+            (string) $application->id,
+            (string) $user->uuid,
+            "Provider status: {$bankAccount->status}.",
         ));
     }
 
@@ -195,16 +205,32 @@ class BankAccountOpeningService
         $status = $this->provider->getAccountStatus($application->external_id);
         $mapped = match ($status['status'] ?? 'unknown') {
             'approved', 'active' => ExternalBankAccountApplication::STATUS_APPROVED,
-            'pending' => ExternalBankAccountApplication::STATUS_PENDING,
-            'rejected' => ExternalBankAccountApplication::STATUS_REJECTED,
-            'closed' => ExternalBankAccountApplication::STATUS_CLOSED,
-            default => ExternalBankAccountApplication::STATUS_REQUIRES_MANUAL_REVIEW,
+            'pending'            => ExternalBankAccountApplication::STATUS_PENDING,
+            'rejected'           => ExternalBankAccountApplication::STATUS_REJECTED,
+            'closed'             => ExternalBankAccountApplication::STATUS_CLOSED,
+            default              => ExternalBankAccountApplication::STATUS_REQUIRES_MANUAL_REVIEW,
         };
 
         if ($mapped === ExternalBankAccountApplication::STATUS_APPROVED) {
             $user = User::query()->where('uuid', $application->user_uuid)->first();
             if ($user instanceof User) {
                 $bankAccount = $this->provider->getAccount($application->external_id);
+                // The status and the account must agree: a provider that
+                // reports "approved" while returning a non-active account
+                // (e.g. frozen) never produces an approval here.
+                if (! $bankAccount->isActive()) {
+                    $application->status = ExternalBankAccountApplication::STATUS_REQUIRES_MANUAL_REVIEW;
+                    $application->rejection_reason = "Provider reports approved but the account itself is '{$bankAccount->status}' — held for manual review.";
+                    $application->save();
+
+                    Event::dispatch(new \App\Domain\Banking\Events\BankAccountOpeningRequiresManualReview(
+                        (string) $application->id,
+                        (string) $user->uuid,
+                        "Provider account status: {$bankAccount->status}.",
+                    ));
+
+                    return $application->fresh() ?? $application;
+                }
                 $this->persistOpenedAccount($user, $application, $bankAccount);
             }
         } else {
@@ -213,6 +239,68 @@ class BankAccountOpeningService
         }
 
         return $application->fresh() ?? $application;
+    }
+
+    /**
+     * Provider reconciliation: re-query every pending / manual-review
+     * application and apply the provider's current verdict. Bounded by
+     * $limit; each application is handled independently, so one
+     * unreachable provider (or one missing account) never aborts the
+     * run — that application is held for manual review instead.
+     *
+     * @return array{processed: int, approved: int, pending: int, rejected: int, closed: int, manual_review: int}
+     */
+    public function reconcilePendingApplications(int $limit = 50): array
+    {
+        $summary = [
+            'processed'     => 0,
+            'approved'      => 0,
+            'pending'       => 0,
+            'rejected'      => 0,
+            'closed'        => 0,
+            'manual_review' => 0,
+        ];
+
+        $applications = ExternalBankAccountApplication::query()
+            ->whereIn('status', [
+                ExternalBankAccountApplication::STATUS_PENDING,
+                ExternalBankAccountApplication::STATUS_REQUIRES_MANUAL_REVIEW,
+            ])
+            ->orderBy('created_at')
+            ->limit($limit)
+            ->get();
+
+        foreach ($applications as $application) {
+            $summary['processed']++;
+
+            try {
+                $synced = $this->syncStatus((string) $application->id);
+                $key = match ($synced->status) {
+                    ExternalBankAccountApplication::STATUS_APPROVED => 'approved',
+                    ExternalBankAccountApplication::STATUS_PENDING  => 'pending',
+                    ExternalBankAccountApplication::STATUS_REJECTED => 'rejected',
+                    ExternalBankAccountApplication::STATUS_CLOSED   => 'closed',
+                    default                                         => 'manual_review',
+                };
+                $summary[$key]++;
+            } catch (Throwable $e) {
+                // Unknown outcome (provider unreachable, account gone):
+                // manual review, never a silent skip and never approval.
+                $application->status = ExternalBankAccountApplication::STATUS_REQUIRES_MANUAL_REVIEW;
+                $application->rejection_reason = 'Reconciliation failed: ' . $e->getMessage();
+                $application->save();
+
+                Event::dispatch(new \App\Domain\Banking\Events\BankAccountOpeningRequiresManualReview(
+                    (string) $application->id,
+                    (string) $application->user_uuid,
+                    $e->getMessage(),
+                ));
+
+                $summary['manual_review']++;
+            }
+        }
+
+        return $summary;
     }
 
     /**
@@ -228,7 +316,7 @@ class BankAccountOpeningService
         return $this->provider->getBalance($application->external_id, $currency ?? $application->currency);
     }
 
-    public function getStatement(string $applicationId, \DateTime $from, \DateTime $to, string $format = 'JSON'): BankStatement
+    public function getStatement(string $applicationId, DateTime $from, DateTime $to, string $format = 'JSON'): BankStatement
     {
         $application = $this->applicationOrFail($applicationId);
         if ($application->external_id === null) {
@@ -260,7 +348,7 @@ class BankAccountOpeningService
         $this->provider->closeAccount(
             $application->external_id,
             $reason,
-            'close:'.(string) $application->id.':'.(string) Str::uuid(),
+            'close:' . (string) $application->id . ':' . (string) Str::uuid(),
         );
 
         $application->status = ExternalBankAccountApplication::STATUS_CLOSED;
@@ -272,7 +360,9 @@ class BankAccountOpeningService
             ->update(['status' => 'closed']);
 
         Event::dispatch(new \App\Domain\Banking\Events\BankAccountOpeningClosed(
-            (string) $application->id, (string) $application->user_uuid, $reason,
+            (string) $application->id,
+            (string) $application->user_uuid,
+            $reason,
         ));
 
         return $application->fresh() ?? $application;
@@ -321,7 +411,9 @@ class BankAccountOpeningService
 
         try {
             $bankAccount = $this->provider->openAccount(
-                (string) $user->uuid, $details, (string) $application->idempotency_key,
+                (string) $user->uuid,
+                $details,
+                (string) $application->idempotency_key,
             );
         } catch (BankOperationException $e) {
             $application->status = ExternalBankAccountApplication::STATUS_REJECTED;
@@ -331,7 +423,7 @@ class BankAccountOpeningService
             throw new AccountOpeningException("Bank rejected the application: {$e->getMessage()}", previous: $e);
         } catch (Throwable $e) {
             $application->status = ExternalBankAccountApplication::STATUS_REQUIRES_MANUAL_REVIEW;
-            $application->rejection_reason = 'Unknown provider outcome: '.$e->getMessage();
+            $application->rejection_reason = 'Unknown provider outcome: ' . $e->getMessage();
             $application->save();
 
             throw new AccountOpeningException(
@@ -420,7 +512,9 @@ class BankAccountOpeningService
         });
 
         Event::dispatch(new \App\Domain\Banking\Events\BankAccountOpeningApproved(
-            (string) $application->id, (string) $user->uuid, $bankAccount->id,
+            (string) $application->id,
+            (string) $user->uuid,
+            $bankAccount->id,
         ));
     }
 }

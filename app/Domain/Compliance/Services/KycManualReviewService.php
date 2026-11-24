@@ -24,7 +24,29 @@ final class KycManualReviewService
 {
     public function __construct(
         private readonly KycService $kycService,
+        private readonly ?KycStatusMachine $statusMachine = null,
     ) {
+    }
+
+    private function statusMachine(): KycStatusMachine
+    {
+        return $this->statusMachine ?? new KycStatusMachine();
+    }
+
+    /**
+     * A verification in manual review is, by definition, a submission:
+     * the user demonstrably submitted something for a human to look at.
+     * If the user-level status was never moved to `pending` (e.g. the
+     * verification was started directly via EnhancedKycService), or the
+     * user was rejected / expired and this verification is their
+     * resubmission, move it to `pending` first so the approval below
+     * has a legal from-state. Approved users are left untouched.
+     */
+    private function ensurePending(User $user, User $reviewer): void
+    {
+        if (in_array($user->kyc_status ?? 'not_submitted', ['not_started', 'not_submitted', 'rejected', 'expired'], true)) {
+            $this->statusMachine()->submit($user, 'reviewer:' . $reviewer->id);
+        }
     }
 
     /** Queue a verification for manual review. Idempotent for an already-queued verification. */
@@ -53,7 +75,7 @@ final class KycManualReviewService
             AuditLog::log(
                 'kyc.manual_review.requested',
                 $verification->user,
-                ['kyc_status'      => $verification->user->kyc_status],
+                ['kyc_status'      => $verification->user?->kyc_status],
                 ['kyc_status'      => 'requires_manual_review'],
                 ['verification_id' => $verification->getKey(), 'reason' => $reason],
                 'kyc,compliance,manual-review'
@@ -63,11 +85,17 @@ final class KycManualReviewService
         });
     }
 
-    /** Human approval. Sets the verification completed and the user KYC level. */
+    /**
+     * Human approval. Sets the verification completed and the user KYC level.
+     *
+     * @param  array<string, mixed>  $options
+     */
     public function approve(KycVerification $verification, User $reviewer, ?string $notes = null, array $options = []): KycManualReview
     {
         return DB::transaction(function () use ($verification, $reviewer, $notes, $options) {
             $this->assertReviewable($verification);
+            $user = $this->reviewUser($verification);
+            $this->ensurePending($user, $reviewer);
 
             $level = $options['level'] ?? $this->levelForVerification($verification);
 
@@ -89,14 +117,14 @@ final class KycManualReviewService
                 'review_notes' => $notes,
             ]);
 
-            $this->kycService->verifyKyc($verification->user, (string) $reviewer->id, array_merge(
+            $this->kycService->verifyKyc($user, (string) $reviewer->id, array_merge(
                 ['level' => $level],
                 $options
             ));
 
             AuditLog::log(
                 'kyc.manual_review.approved',
-                $verification->user,
+                $user,
                 ['kyc_status'      => 'requires_manual_review'],
                 ['kyc_status'      => 'approved', 'kyc_level' => $level],
                 ['verification_id' => $verification->getKey(), 'reviewer_id' => $reviewer->id, 'notes' => $notes],
@@ -112,6 +140,7 @@ final class KycManualReviewService
     {
         return DB::transaction(function () use ($verification, $reviewer, $reason, $notes) {
             $this->assertReviewable($verification);
+            $user = $this->reviewUser($verification);
 
             $review = KycManualReview::create([
                 'kyc_verification_id' => $verification->getKey(),
@@ -132,11 +161,11 @@ final class KycManualReviewService
                 'review_notes'   => $notes,
             ]);
 
-            $this->kycService->rejectKyc($verification->user, (string) $reviewer->id, $reason);
+            $this->kycService->rejectKyc($user, (string) $reviewer->id, $reason);
 
             AuditLog::log(
                 'kyc.manual_review.rejected',
-                $verification->user,
+                $user,
                 ['kyc_status'      => 'requires_manual_review'],
                 ['kyc_status'      => 'rejected'],
                 ['verification_id' => $verification->getKey(), 'reviewer_id' => $reviewer->id, 'reason' => $reason],
@@ -163,6 +192,21 @@ final class KycManualReviewService
             ->with(['verification', 'reviewer'])
             ->latest()
             ->get();
+    }
+
+    /** The user a verification belongs to. A review without a user is not reviewable. */
+    private function reviewUser(KycVerification $verification): User
+    {
+        $user = $verification->user;
+
+        if (! $user instanceof User) {
+            throw new LogicException(sprintf(
+                'KYC verification %s has no user and cannot be reviewed.',
+                $verification->getKey()
+            ));
+        }
+
+        return $user;
     }
 
     /** @throws LogicException */

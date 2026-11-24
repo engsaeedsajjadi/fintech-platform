@@ -5,10 +5,9 @@ declare(strict_types=1);
 namespace App\Domain\Meeting\Notifications;
 
 use App\Domain\Meeting\Models\Meeting;
-use App\Domain\Meeting\Support\JalaliDateHelper;
+use App\Domain\Meeting\Support\LocalizedDateHelper;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Notifications\Messages\MailMessage;
 use Illuminate\Notifications\Notification;
 
 abstract class MeetingNotification extends Notification implements ShouldQueue
@@ -24,10 +23,15 @@ abstract class MeetingNotification extends Notification implements ShouldQueue
         return ['mail', 'database'];
     }
 
+    /**
+     * Locale-aware start time: Jalali + Persian digits for `fa`,
+     * Gregorian for `en`. The notification is rendered in the
+     * recipient's locale when the notification is sent through a
+     * locale-aware channel; the app locale is used otherwise.
+     */
     protected function when(): string
     {
-        return JalaliDateHelper::format($this->meeting->starts_at, false)
-            .' ('.$this->meeting->starts_at->format('Y-m-d H:i').')';
+        return LocalizedDateHelper::format($this->meeting->starts_at);
     }
 
     /** @return array<string, mixed> */
@@ -35,11 +39,11 @@ abstract class MeetingNotification extends Notification implements ShouldQueue
     {
         return [
             'meeting_id' => $this->meeting->id,
-            'title' => $this->meeting->title,
-            'type' => $this->meeting->type->value,
-            'status' => $this->meeting->status->value,
-            'starts_at' => $this->meeting->starts_at->toIso8601String(),
-            'join_url' => $this->meeting->join_url,
+            'title'      => $this->meeting->title,
+            'type'       => $this->meeting->type->value,
+            'status'     => $this->meeting->status->value,
+            'starts_at'  => $this->meeting->starts_at->toIso8601String(),
+            'join_url'   => $this->meeting->join_url,
         ];
     }
 }

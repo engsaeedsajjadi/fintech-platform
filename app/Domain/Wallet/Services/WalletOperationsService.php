@@ -19,6 +19,7 @@ use App\Domain\Wallet\Workflows\WalletWithdrawWorkflow;
 use Exception;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use Workflow\WorkflowStub;
 
 class WalletOperationsService implements WalletOperationsInterface
@@ -30,6 +31,16 @@ class WalletOperationsService implements WalletOperationsInterface
 
     private const LOCK_TTL = 3600; // 1 hour (reduced from 24h for security)
 
+    /**
+     * Reservation durability limit, kept visible: a reservation lives in
+     * the cache (LOCK_TTL), not in the database. If the cache entry is
+     * evicted or expires, the debit made by lockFunds stands but the
+     * reservation can no longer be unlocked or executed — that needs
+     * operator reconciliation (the funds are not lost, the lock is).
+     * Durable DB-backed reservations are a follow-up; until then the
+     * per-wallet / per-lock cache locks below at least make concurrent
+     * lock / unlock / execute calls serial instead of racy.
+     */
     public function __construct(
         private readonly ExchangeRateService $exchangeRateService
     ) {
@@ -49,6 +60,7 @@ class WalletOperationsService implements WalletOperationsInterface
         $this->validateUuid($walletId, 'wallet ID');
         $this->validateAssetCode($assetCode);
         $this->validatePositiveAmount($amount);
+        $this->assertMinorUnits($amount);
         $this->validateReference($reference);
         $this->validateMetadata($metadata);
 
@@ -65,7 +77,7 @@ class WalletOperationsService implements WalletOperationsInterface
             $workflow->start(
                 __account_uuid($walletId),
                 $assetCode,
-                $amount
+                (int) $amount
             );
 
             $this->auditOperationSuccess('wallet_deposit', [
@@ -97,6 +109,7 @@ class WalletOperationsService implements WalletOperationsInterface
         $this->validateUuid($walletId, 'wallet ID');
         $this->validateAssetCode($assetCode);
         $this->validatePositiveAmount($amount);
+        $this->assertMinorUnits($amount);
         $this->validateReference($reference);
         $this->validateMetadata($metadata);
 
@@ -133,7 +146,7 @@ class WalletOperationsService implements WalletOperationsInterface
             $workflow->start(
                 __account_uuid($walletId),
                 $assetCode,
-                $amount
+                (int) $amount
             );
 
             $this->auditOperationSuccess('wallet_withdraw', [
@@ -217,6 +230,7 @@ class WalletOperationsService implements WalletOperationsInterface
         $this->validateUuid($walletId, 'wallet ID');
         $this->validateAssetCode($assetCode);
         $this->validatePositiveAmount($amount);
+        $this->assertMinorUnits($amount);
         $this->validateReference($reason, 'reason');
         $this->validateMetadata($metadata);
 
@@ -227,67 +241,73 @@ class WalletOperationsService implements WalletOperationsInterface
             'reason'     => $reason,
         ]);
 
-        $account = Account::where('uuid', $walletId)->first();
+        // Serialised per wallet: the balance check and the debit below are
+        // two separate steps, so two concurrent lockFunds calls could both
+        // pass the check and over-lock the same balance. The cache lock
+        // makes check-then-debit atomic across callers.
+        return Cache::lock("wallet_lock_op:{$walletId}", 10)->block(5, function () use ($walletId, $assetCode, $amount, $reason, $metadata): string {
+            $account = Account::where('uuid', $walletId)->first();
 
-        if (! $account) {
-            $this->auditOperationFailure('wallet_lock_funds', 'Account not found', [
-                'wallet_id' => $walletId,
-            ]);
-            throw new InsufficientBalanceException($walletId, $assetCode, $amount, '0');
-        }
+            if (! $account) {
+                $this->auditOperationFailure('wallet_lock_funds', 'Account not found', [
+                    'wallet_id' => $walletId,
+                ]);
+                throw new InsufficientBalanceException($walletId, $assetCode, $amount, '0');
+            }
 
-        $availableBalance = (string) $account->getBalance($assetCode);
+            $availableBalance = (string) $account->getBalance($assetCode);
 
-        if ($this->compareAmounts($availableBalance, $amount) < 0) {
-            $this->auditOperationFailure('wallet_lock_funds', 'Insufficient balance', [
-                'wallet_id' => $walletId,
-                'required'  => $amount,
-                'available' => $availableBalance,
-            ]);
-            throw new InsufficientBalanceException($walletId, $assetCode, $amount, $availableBalance);
-        }
+            if ($this->compareAmounts($availableBalance, $amount) < 0) {
+                $this->auditOperationFailure('wallet_lock_funds', 'Insufficient balance', [
+                    'wallet_id' => $walletId,
+                    'required'  => $amount,
+                    'available' => $availableBalance,
+                ]);
+                throw new InsufficientBalanceException($walletId, $assetCode, $amount, $availableBalance);
+            }
 
-        $lockId = 'lock_' . Str::uuid();
+            $lockId = 'lock_' . Str::uuid();
 
-        // Store lock in cache with encryption for sensitive data
-        $lockData = [
-            'wallet_id'  => $walletId,
-            'asset_code' => $assetCode,
-            'amount'     => $amount,
-            'reason'     => $reason,
-            'metadata'   => $metadata,
-            'created_at' => now()->toIso8601String(),
-            'expires_at' => now()->addSeconds(self::LOCK_TTL)->toIso8601String(),
-        ];
+            // Store lock in cache with encryption for sensitive data
+            $lockData = [
+                'wallet_id'  => $walletId,
+                'asset_code' => $assetCode,
+                'amount'     => $amount,
+                'reason'     => $reason,
+                'metadata'   => $metadata,
+                'created_at' => now()->toIso8601String(),
+                'expires_at' => now()->addSeconds(self::LOCK_TTL)->toIso8601String(),
+            ];
 
-        // Encrypt the lock data before storing
-        $encryptedData = encrypt($lockData);
-        Cache::put(self::LOCK_PREFIX . $lockId, $encryptedData, self::LOCK_TTL);
+            // Encrypt the lock data before storing
+            $encryptedData = encrypt($lockData);
+            Cache::put(self::LOCK_PREFIX . $lockId, $encryptedData, self::LOCK_TTL);
 
-        // Deduct from available balance (via withdrawal workflow)
-        try {
-            $workflow = WorkflowStub::make(WalletWithdrawWorkflow::class);
-            $workflow->start(
-                __account_uuid($walletId),
-                $assetCode,
-                $amount
-            );
+            // Deduct from available balance (via withdrawal workflow)
+            try {
+                $workflow = WorkflowStub::make(WalletWithdrawWorkflow::class);
+                $workflow->start(
+                    __account_uuid($walletId),
+                    $assetCode,
+                    (int) $amount
+                );
 
-            $this->auditOperationSuccess('wallet_lock_funds', [
-                'lock_id'   => $lockId,
-                'wallet_id' => $walletId,
-                'amount'    => $amount,
-            ]);
+                $this->auditOperationSuccess('wallet_lock_funds', [
+                    'lock_id'   => $lockId,
+                    'wallet_id' => $walletId,
+                    'amount'    => $amount,
+                ]);
 
-            return $lockId;
-        } catch (Exception $e) {
-            // Clean up the lock if withdrawal fails
-            Cache::forget(self::LOCK_PREFIX . $lockId);
-            $this->auditOperationFailure('wallet_lock_funds', $e->getMessage(), [
-                'wallet_id' => $walletId,
-            ]);
-            throw $e;
-        }
+                return $lockId;
+            } catch (Exception $e) {
+                // Clean up the lock if withdrawal fails
+                Cache::forget(self::LOCK_PREFIX . $lockId);
+                $this->auditOperationFailure('wallet_lock_funds', $e->getMessage(), [
+                    'wallet_id' => $walletId,
+                ]);
+                throw $e;
+            }
+        });
     }
 
     /**
@@ -299,42 +319,48 @@ class WalletOperationsService implements WalletOperationsInterface
 
         $this->auditOperationStart('wallet_unlock_funds', ['lock_id' => $lockId]);
 
-        $encryptedData = Cache::get(self::LOCK_PREFIX . $lockId);
+        // Serialised per lock: without this, two concurrent unlocks both
+        // read the reservation before either forgets it, and the locked
+        // amount is credited back twice. The second caller now waits,
+        // then finds no reservation and gets LockNotFoundException.
+        return Cache::lock(self::LOCK_PREFIX . "op:{$lockId}", 10)->block(5, function () use ($lockId): bool {
+            $encryptedData = Cache::get(self::LOCK_PREFIX . $lockId);
 
-        if (! $encryptedData) {
-            $this->auditOperationFailure('wallet_unlock_funds', 'Lock not found', [
-                'lock_id' => $lockId,
-            ]);
-            throw new LockNotFoundException($lockId);
-        }
+            if (! $encryptedData) {
+                $this->auditOperationFailure('wallet_unlock_funds', 'Lock not found', [
+                    'lock_id' => $lockId,
+                ]);
+                throw new LockNotFoundException($lockId);
+            }
 
-        // Decrypt the lock data
-        $lockData = decrypt($encryptedData);
+            // Decrypt the lock data
+            $lockData = decrypt($encryptedData);
 
-        try {
-            // Credit back the locked amount
-            $workflow = WorkflowStub::make(WalletDepositWorkflow::class);
-            $workflow->start(
-                __account_uuid($lockData['wallet_id']),
-                $lockData['asset_code'],
-                $lockData['amount']
-            );
+            try {
+                // Credit back the locked amount
+                $workflow = WorkflowStub::make(WalletDepositWorkflow::class);
+                $workflow->start(
+                    __account_uuid($lockData['wallet_id']),
+                    $lockData['asset_code'],
+                    (int) $lockData['amount']
+                );
 
-            Cache::forget(self::LOCK_PREFIX . $lockId);
+                Cache::forget(self::LOCK_PREFIX . $lockId);
 
-            $this->auditOperationSuccess('wallet_unlock_funds', [
-                'lock_id'   => $lockId,
-                'wallet_id' => $lockData['wallet_id'],
-                'amount'    => $lockData['amount'],
-            ]);
+                $this->auditOperationSuccess('wallet_unlock_funds', [
+                    'lock_id'   => $lockId,
+                    'wallet_id' => $lockData['wallet_id'],
+                    'amount'    => $lockData['amount'],
+                ]);
 
-            return true;
-        } catch (Exception $e) {
-            $this->auditOperationFailure('wallet_unlock_funds', $e->getMessage(), [
-                'lock_id' => $lockId,
-            ]);
-            throw $e;
-        }
+                return true;
+            } catch (Exception $e) {
+                $this->auditOperationFailure('wallet_unlock_funds', $e->getMessage(), [
+                    'lock_id' => $lockId,
+                ]);
+                throw $e;
+            }
+        });
     }
 
     /**
@@ -351,46 +377,50 @@ class WalletOperationsService implements WalletOperationsInterface
             'destination_wallet_id' => $destinationWalletId,
         ]);
 
-        $encryptedData = Cache::get(self::LOCK_PREFIX . $lockId);
+        // Serialised per lock, like unlockFunds: two concurrent executes
+        // must not credit the destination twice for one reservation.
+        return Cache::lock(self::LOCK_PREFIX . "op:{$lockId}", 10)->block(5, function () use ($lockId, $destinationWalletId): string {
+            $encryptedData = Cache::get(self::LOCK_PREFIX . $lockId);
 
-        if (! $encryptedData) {
-            $this->auditOperationFailure('wallet_execute_lock', 'Lock not found', [
-                'lock_id' => $lockId,
-            ]);
-            throw new LockNotFoundException($lockId);
-        }
+            if (! $encryptedData) {
+                $this->auditOperationFailure('wallet_execute_lock', 'Lock not found', [
+                    'lock_id' => $lockId,
+                ]);
+                throw new LockNotFoundException($lockId);
+            }
 
-        // Decrypt the lock data
-        $lockData = decrypt($encryptedData);
+            // Decrypt the lock data
+            $lockData = decrypt($encryptedData);
 
-        $transactionId = (string) Str::uuid();
+            $transactionId = (string) Str::uuid();
 
-        try {
-            // Credit the destination wallet
-            $workflow = WorkflowStub::make(WalletDepositWorkflow::class);
-            $workflow->start(
-                __account_uuid($destinationWalletId),
-                $lockData['asset_code'],
-                $lockData['amount']
-            );
+            try {
+                // Credit the destination wallet
+                $workflow = WorkflowStub::make(WalletDepositWorkflow::class);
+                $workflow->start(
+                    __account_uuid($destinationWalletId),
+                    $lockData['asset_code'],
+                    (int) $lockData['amount']
+                );
 
-            // Remove the lock
-            Cache::forget(self::LOCK_PREFIX . $lockId);
+                // Remove the lock
+                Cache::forget(self::LOCK_PREFIX . $lockId);
 
-            $this->auditOperationSuccess('wallet_execute_lock', [
-                'transaction_id'        => $transactionId,
-                'lock_id'               => $lockId,
-                'destination_wallet_id' => $destinationWalletId,
-                'amount'                => $lockData['amount'],
-            ]);
+                $this->auditOperationSuccess('wallet_execute_lock', [
+                    'transaction_id'        => $transactionId,
+                    'lock_id'               => $lockId,
+                    'destination_wallet_id' => $destinationWalletId,
+                    'amount'                => $lockData['amount'],
+                ]);
 
-            return $transactionId;
-        } catch (Exception $e) {
-            $this->auditOperationFailure('wallet_execute_lock', $e->getMessage(), [
-                'lock_id' => $lockId,
-            ]);
-            throw $e;
-        }
+                return $transactionId;
+            } catch (Exception $e) {
+                $this->auditOperationFailure('wallet_execute_lock', $e->getMessage(), [
+                    'lock_id' => $lockId,
+                ]);
+                throw $e;
+            }
+        });
     }
 
     /**
@@ -409,6 +439,7 @@ class WalletOperationsService implements WalletOperationsInterface
         $this->validateUuid($toWalletId, 'destination wallet ID');
         $this->validateAssetCode($assetCode);
         $this->validatePositiveAmount($amount);
+        $this->assertMinorUnits($amount);
         $this->validateReference($reference);
         $this->validateMetadata($metadata);
 
@@ -447,7 +478,7 @@ class WalletOperationsService implements WalletOperationsInterface
                 __account_uuid($fromWalletId),
                 __account_uuid($toWalletId),
                 $assetCode,
-                $amount,
+                (int) $amount,
                 $reference
             );
 
@@ -483,6 +514,7 @@ class WalletOperationsService implements WalletOperationsInterface
         $this->validateAssetCode($fromAssetCode, 'source asset code');
         $this->validateAssetCode($toAssetCode, 'target asset code');
         $this->validatePositiveAmount($amount);
+        $this->assertMinorUnits($amount);
 
         if ($exchangeRate !== null) {
             $this->validateExchangeRate($exchangeRate);
@@ -536,7 +568,7 @@ class WalletOperationsService implements WalletOperationsInterface
                 __account_uuid($walletId),
                 $fromAssetCode,
                 $toAssetCode,
-                $amount
+                (int) $amount
             );
 
             $result = [
@@ -600,6 +632,20 @@ class WalletOperationsService implements WalletOperationsInterface
             return (string) $this->exchangeRateService->getRate($fromAssetCode, $toAssetCode);
         } catch (Exception) {
             return null;
+        }
+    }
+
+    /**
+     * Amounts forwarded to the wallet workflows are integer minor units:
+     * the workflow `execute()` signatures take `int $amount` and the
+     * workflow files have no strict_types, so a decimal string such as
+     * '10.50' would be silently truncated to 10 by coercive typing.
+     * Refuse it fail-closed instead.
+     */
+    private function assertMinorUnits(string $amount): void
+    {
+        if (preg_match('/^\d+$/', $amount) !== 1) {
+            throw new InvalidArgumentException("Amount '{$amount}' must be an integer number of minor units; decimal amounts are refused instead of being silently truncated.");
         }
     }
 

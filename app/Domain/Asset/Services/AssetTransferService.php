@@ -12,9 +12,12 @@ use App\Domain\Asset\Exceptions\AssetNotFoundException;
 use App\Domain\Asset\Exceptions\InsufficientAssetBalanceException;
 use App\Domain\Asset\Exceptions\UnsupportedAssetConversionException;
 use App\Domain\Asset\Models\Asset;
+use App\Domain\Asset\ValueObjects\CurrencyPrecisionRegistry;
 use App\Domain\Shared\Contracts\AssetTransferInterface;
 use App\Domain\Shared\Logging\AuditLogger;
 use App\Domain\Shared\Validation\FinancialInputValidator;
+use Brick\Math\BigDecimal;
+use Brick\Math\RoundingMode;
 use Exception;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
@@ -339,10 +342,11 @@ class AssetTransferService implements AssetTransferInterface
         $b = $rate;
         $convertedAmount = bcmul($a, $b, 8);
 
-        // Assume 0.1% fee for conversions
-        /** @var numeric-string $feeRate */
-        $feeRate = '0.001';
-        $feeAmount = bcmul($convertedAmount, $feeRate, 8);
+        // Fee from the configured conversion fee (wallet.conversion.fee_bps),
+        // never a hardcoded percentage: the old 0.1% here disagreed with
+        // the 0.5% ConversionService charges for the same operation.
+        $feeBps = (int) config('wallet.conversion.fee_bps', 50);
+        $feeAmount = bcdiv(bcmul($convertedAmount, (string) $feeBps, 8), '10000', 8);
         $netAmount = bcsub($convertedAmount, $feeAmount, 8);
 
         return [
@@ -405,10 +409,12 @@ class AssetTransferService implements AssetTransferInterface
     {
         $this->validateAssetCode($assetCode);
 
-        $asset = Asset::where('code', $assetCode)->first();
-        $decimals = $asset->decimals ?? 2;
+        $decimals = $this->precisionOf($assetCode);
 
-        return number_format((float) $amount, $decimals, '.', '');
+        // Exact decimal formatting: the old number_format((float) $amount)
+        // lost integer precision above 2^53 and rounded through binary
+        // float before formatting.
+        return (string) BigDecimal::of($amount)->toScale($decimals, RoundingMode::HALF_UP);
     }
 
     /**
@@ -477,8 +483,19 @@ class AssetTransferService implements AssetTransferInterface
         return bcdiv((string) $amount, bcpow('10', (string) $precision), $precision);
     }
 
+    /**
+     * Precision of an asset: the registered `assets` row first, then the
+     * canonical currency registry (LedgerPrecision-backed). The old
+     * hardcoded fallback of 2 silently mis-scaled every unregistered
+     * asset (e.g. BTC at 2 instead of 8).
+     */
     private function precisionOf(string $assetCode): int
     {
-        return (int) (Asset::query()->where('code', $assetCode)->value('precision') ?? 2);
+        $row = Asset::query()->where('code', $assetCode)->value('precision');
+        if ($row !== null) {
+            return (int) $row;
+        }
+
+        return CurrencyPrecisionRegistry::for($assetCode)->minorUnitExponent;
     }
 }

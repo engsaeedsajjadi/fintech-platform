@@ -14,6 +14,9 @@ use App\Domain\Banking\Models\BankCapabilities;
 use App\Domain\Banking\Models\BankStatement;
 use App\Domain\Banking\Models\BankTransaction;
 use App\Domain\Banking\Models\BankTransfer;
+use App\Domain\Banking\Providers\Contracts\ExternalProviderInterface;
+use App\Domain\Banking\Providers\Contracts\ProviderMode;
+use App\Domain\Banking\Providers\Contracts\ProviderResult;
 use Carbon\Carbon;
 use DateTime;
 use Illuminate\Support\Collection;
@@ -40,7 +43,7 @@ use RuntimeException;
  *   queries report approved — exercises the status-tracking path.
  * - 'rejected': openAccount() throws a provider rejection.
  */
-class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
+class SandboxBankAdapter implements IBankConnector, AccountProviderInterface, ExternalProviderInterface
 {
     public const BANK_CODE = 'SANDBOX';
 
@@ -74,6 +77,18 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
     public function getBankCode(): string
     {
         return self::BANK_CODE;
+    }
+
+    public function getMode(): ProviderMode
+    {
+        return ProviderMode::SANDBOX;
+    }
+
+    public function healthCheck(): ProviderResult
+    {
+        return $this->isAvailable()
+            ? ProviderResult::success('sandbox', 'Sandbox bank adapter is available (simulated — not a real bank).')
+            : ProviderResult::failed('sandbox', 'unavailable', 'Sandbox bank adapter is unavailable.');
     }
 
     public function getBankName(): string
@@ -131,7 +146,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
         }
 
         // Idempotency: the same key returns the same account, never a second.
-        $cachedId = Cache::get(self::IDEMPOTENCY_PREFIX.$idempotencyKey);
+        $cachedId = Cache::get(self::IDEMPOTENCY_PREFIX . $idempotencyKey);
         if (is_string($cachedId) && $cachedId !== '') {
             return $this->getAccount($cachedId);
         }
@@ -139,7 +154,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
         $outcome = (string) ($accountDetails['sandbox_outcome'] ?? 'approved');
         if ($outcome === 'rejected') {
             throw new BankOperationException(
-                'Sandbox bank rejected the application: '.((string) ($accountDetails['sandbox_rejection_reason'] ?? 'simulated rejection (sandbox_outcome=rejected)')),
+                'Sandbox bank rejected the application: ' . ((string) ($accountDetails['sandbox_rejection_reason'] ?? 'simulated rejection (sandbox_outcome=rejected)')),
             );
         }
         if (! in_array($outcome, ['approved', 'pending_then_approved'], true)) {
@@ -148,7 +163,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
 
         $accountNumber = $this->testAccountNumber($idempotencyKey);
         $iban = $this->testIban($accountNumber);
-        $externalId = 'sbx_'.substr(hash('sha256', $idempotencyKey), 0, 24);
+        $externalId = 'sbx_' . substr(hash('sha256', $idempotencyKey), 0, 24);
         $status = $outcome === 'pending_then_approved' ? 'pending' : 'active';
 
         $record = [
@@ -166,8 +181,8 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
             'status_calls'    => 0,
             'idempotency_key' => $idempotencyKey,
         ];
-        Cache::put(self::CACHE_PREFIX.$externalId, $record, now()->addDay());
-        Cache::put(self::IDEMPOTENCY_PREFIX.$idempotencyKey, $externalId, now()->addDay());
+        Cache::put(self::CACHE_PREFIX . $externalId, $record, now()->addDay());
+        Cache::put(self::IDEMPOTENCY_PREFIX . $idempotencyKey, $externalId, now()->addDay());
 
         return $this->toBankAccount($record);
     }
@@ -182,7 +197,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
         $record = $this->recordOrFail($externalAccountId);
         $record['status'] = 'closed';
         $record['closure_reason'] = $reason;
-        Cache::put(self::CACHE_PREFIX.$externalAccountId, $record, now()->addDay());
+        Cache::put(self::CACHE_PREFIX . $externalAccountId, $record, now()->addDay());
 
         return true;
     }
@@ -191,7 +206,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
     {
         $record = $this->recordOrFail($externalAccountId);
         $record['status'] = 'frozen';
-        Cache::put(self::CACHE_PREFIX.$externalAccountId, $record, now()->addDay());
+        Cache::put(self::CACHE_PREFIX . $externalAccountId, $record, now()->addDay());
 
         return true;
     }
@@ -200,7 +215,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
     {
         $record = $this->recordOrFail($externalAccountId);
         $record['status'] = 'active';
-        Cache::put(self::CACHE_PREFIX.$externalAccountId, $record, now()->addDay());
+        Cache::put(self::CACHE_PREFIX . $externalAccountId, $record, now()->addDay());
 
         return true;
     }
@@ -233,15 +248,16 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
             if ($record['status_calls'] >= 2) {
                 $record['status'] = 'active';
             }
-            Cache::put(self::CACHE_PREFIX.$externalAccountId, $record, now()->addDay());
+            Cache::put(self::CACHE_PREFIX . $externalAccountId, $record, now()->addDay());
         }
 
         $status = match ($record['status'] ?? 'unknown') {
             'active'  => 'approved',
             'pending' => 'pending',
             'closed'  => 'closed',
-            'frozen'  => 'approved',
-            default   => 'unknown',
+            // A frozen account is NOT approved: report it as unknown so
+            // the opening workflow holds it for manual review.
+            default => 'unknown',
         };
 
         return ['status' => $status, 'provider_reference' => $externalAccountId];
@@ -401,7 +417,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
      */
     private function recordOrFail(string $externalAccountId): array
     {
-        $record = Cache::get(self::CACHE_PREFIX.$externalAccountId);
+        $record = Cache::get(self::CACHE_PREFIX . $externalAccountId);
         if (! is_array($record)) {
             throw new AccountNotFoundException("Sandbox bank account not found: {$externalAccountId}");
         }
@@ -421,7 +437,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
             $digits .= ctype_digit($hash[$i]) ? $hash[$i] : (string) (ord($hash[$i]) % 10);
         }
 
-        return 'SBX'.str_pad($digits, 10, '0');
+        return 'SBX' . str_pad($digits, 10, '0');
     }
 
     /**
@@ -431,12 +447,12 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
      */
     private function testIban(string $accountNumber): string
     {
-        $bban = self::SANDBOX_BANK_CODE.$accountNumber;
+        $bban = self::SANDBOX_BANK_CODE . $accountNumber;
         // Check digits: 98 - mod97 of the full IBAN shape with '00' checks
         // (mod97() rearranges country+check to the end, as ISO 13616 does).
-        $check = 98 - $this->mod97('DE00'.$bban);
+        $check = 98 - $this->mod97('DE00' . $bban);
 
-        return 'DE'.str_pad((string) $check, 2, '0', STR_PAD_LEFT).$bban;
+        return 'DE' . str_pad((string) $check, 2, '0', STR_PAD_LEFT) . $bban;
     }
 
     /**
@@ -444,7 +460,7 @@ class SandboxBankAdapter implements IBankConnector, AccountProviderInterface
      */
     private function mod97(string $iban): int
     {
-        $rearranged = substr($iban, 4).substr($iban, 0, 4);
+        $rearranged = substr($iban, 4) . substr($iban, 0, 4);
         $numeric = '';
         foreach (str_split($rearranged) as $char) {
             $numeric .= ctype_digit($char) ? $char : (string) (ord($char) - 55);

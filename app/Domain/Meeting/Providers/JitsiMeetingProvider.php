@@ -35,11 +35,11 @@ final class JitsiMeetingProvider implements VideoMeetingProviderInterface
         $joinUrl = $this->buildJoinUrl($meeting, $roomName);
 
         return [
-            'provider' => 'jitsi',
+            'provider'  => 'jitsi',
             'room_name' => $roomName,
-            'join_url' => $joinUrl,
-            'jwt' => $this->jwtConfigured(),
-            'sandbox' => false,
+            'join_url'  => $joinUrl,
+            'jwt'       => $this->jwtConfigured(),
+            'sandbox'   => false,
         ];
     }
 
@@ -64,6 +64,15 @@ final class JitsiMeetingProvider implements VideoMeetingProviderInterface
             );
         }
 
+        // A typo'd base URL (e.g. "meet.example" or "ftp://…") must fail
+        // here with a clear error, not produce a join URL that goes nowhere.
+        if (! filter_var($baseUrl, FILTER_VALIDATE_URL)
+            || ! in_array((string) parse_url($baseUrl, PHP_URL_SCHEME), ['http', 'https'], true)) {
+            throw new MeetingProviderNotConfiguredException(
+                'Jitsi is not configured: JITSI_BASE_URL must be a valid http(s) URL.'
+            );
+        }
+
         return rtrim($baseUrl, '/');
     }
 
@@ -75,12 +84,12 @@ final class JitsiMeetingProvider implements VideoMeetingProviderInterface
 
     private function roomName(Meeting $meeting): string
     {
-        return 'finaegis-'.Str::lower(Str::substr(str_replace('-', '', (string) $meeting->id), 0, 12));
+        return 'finaegis-' . Str::lower(Str::substr(str_replace('-', '', (string) $meeting->id), 0, 12));
     }
 
     private function buildJoinUrl(Meeting $meeting, string $roomName): string
     {
-        $url = $this->baseUrl().'/'.$roomName;
+        $url = $this->baseUrl() . '/' . $roomName;
 
         if (! $this->jwtConfigured()) {
             return $url;
@@ -88,16 +97,16 @@ final class JitsiMeetingProvider implements VideoMeetingProviderInterface
 
         $now = time();
         $payload = [
-            'aud' => 'jitsi',
-            'iss' => (string) config('meeting.jitsi.app_id'),
-            'sub' => $roomName,
-            'room' => $roomName,
-            'iat' => $now,
-            'nbf' => $now,
-            'exp' => $now + (int) config('meeting.jitsi.jwt_ttl', 3600),
+            'aud'     => 'jitsi',
+            'iss'     => (string) config('meeting.jitsi.app_id'),
+            'sub'     => $roomName,
+            'room'    => $roomName,
+            'iat'     => $now,
+            'nbf'     => $now,
+            'exp'     => $now + max(60, (int) config('meeting.jitsi.jwt_ttl', 3600)),
             'context' => [
                 'user' => [
-                    'name' => (string) ($meeting->host?->name ?? 'Guest'),
+                    'name'  => (string) ($meeting->host?->name ?? 'Guest'),
                     'email' => (string) ($meeting->host?->email ?? ''),
                 ],
             ],
@@ -105,6 +114,6 @@ final class JitsiMeetingProvider implements VideoMeetingProviderInterface
 
         $token = JWT::encode($payload, (string) config('meeting.jitsi.jwt_secret'), 'HS256');
 
-        return $url.'?jwt='.$token;
+        return $url . '?jwt=' . $token;
     }
 }

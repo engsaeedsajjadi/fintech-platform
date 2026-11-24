@@ -6,6 +6,8 @@ namespace App\Domain\Compliance\Services;
 
 use App\Domain\Compliance\Events\KycVerificationFailed;
 use App\Domain\Compliance\Events\KycVerificationStarted;
+use App\Domain\Compliance\Kyc\Exceptions\InvalidKycTransitionException;
+use App\Domain\Compliance\Models\AuditLog;
 use App\Domain\Compliance\Models\KycVerification;
 use App\Domain\TrustCert\Services\CertificateAuthorityService;
 use App\Models\User;
@@ -54,8 +56,11 @@ class OndatoService
 
     private string $webhookSecret;
 
-    public function __construct()
+    private ?KycService $kycService;
+
+    public function __construct(?KycService $kycService = null)
     {
+        $this->kycService = $kycService;
         $this->applicationId = (string) config('services.ondato.application_id', '');
         $this->secret = (string) config('services.ondato.secret', '');
         $this->setupId = (string) config('services.ondato.setup_id', '');
@@ -63,6 +68,11 @@ class OndatoService
         $this->webhookSecret = (string) config('services.ondato.webhook_secret', '');
         $this->kycApiUrl = rtrim((string) config('services.ondato.kyc_api_url', 'https://sandbox-kycapi.ondato.com'), '/');
         $this->verifIdApiUrl = rtrim((string) config('services.ondato.verifid_api_url', 'https://verifid.ondato.com'), '/');
+    }
+
+    private function kycService(): KycService
+    {
+        return $this->kycService ??= app(KycService::class);
     }
 
     /**
@@ -293,7 +303,12 @@ class OndatoService
         $extractedData = $this->extractDocumentData($record);
 
         $verification->update([
-            'confidence_score'  => 95.0,
+            // The Ondato record carries no confidence score, so none is
+            // invented here: a hardcoded 95.0 used to be written, which
+            // would have presented a fabricated score as provider evidence.
+            // A null score means "provider gave no score"; risk assessment
+            // treats a missing score as no confidence evidence.
+            'confidence_score'  => null,
             'extracted_data'    => $extractedData,
             'verification_data' => array_merge(
                 $verification->verification_data ?? [],
@@ -313,16 +328,28 @@ class OndatoService
             return;
         }
 
-        // Update user KYC status
+        // Update user KYC status through the state machine: the approval
+        // is a real provider verdict (the Ondato API record was
+        // re-confirmed above), so it is an audited transition, never a
+        // silent direct update. An illegal from-state is logged, not
+        // retried — the verification record itself is already completed.
         /** @var User|null $user */
         $user = $verification->user;
         if ($user) {
-            $user->update([
-                'kyc_status'      => 'approved',
-                'kyc_approved_at' => now(),
-                'kyc_expires_at'  => now()->addYears(2),
-                'kyc_level'       => 'enhanced',
-            ]);
+            try {
+                $this->kycService()->verifyKyc($user, 'ondato-webhook', [
+                    'level'      => 'enhanced',
+                    'expires_at' => now()->addYears(2),
+                    'basis'      => KycStatusMachine::BASIS_PROVIDER_VERDICT,
+                ]);
+            } catch (InvalidKycTransitionException $e) {
+                Log::warning('Ondato approval not applied to user status: illegal transition', [
+                    'verification_id' => $verification->id,
+                    'user_id'         => $user->id,
+                    'kyc_status'      => $user->kyc_status,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
         }
 
         // If linked to a TrustCertApplication, update it and issue certificate
@@ -409,11 +436,21 @@ class OndatoService
             ),
         ]);
 
-        // Update user KYC status
+        // Update user KYC status through the state machine (audited).
+        // A rejection may follow an approval — it takes access away.
         /** @var User|null $user */
         $user = $verification->user;
         if ($user) {
-            $user->update(['kyc_status' => 'rejected']);
+            try {
+                $this->kycService()->rejectKyc($user, 'ondato-webhook', $reason);
+            } catch (InvalidKycTransitionException $e) {
+                Log::warning('Ondato rejection not applied to user status: illegal transition', [
+                    'verification_id' => $verification->id,
+                    'user_id'         => $user->id,
+                    'kyc_status'      => $user->kyc_status,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
         }
 
         // If linked to a TrustCertApplication, update it
@@ -447,8 +484,20 @@ class OndatoService
 
         /** @var User|null $user */
         $user = $verification->user;
+        // Only a still-pending user expires here: an approved user's
+        // approval lapses on its own kyc_expires_at (checkExpiredKyc),
+        // not when a verification record expires.
         if ($user && $user->kyc_status === 'pending') {
-            $user->update(['kyc_status' => 'expired']);
+            try {
+                $this->kycService()->expireKyc($user, 'ondato-webhook');
+            } catch (InvalidKycTransitionException $e) {
+                Log::warning('Ondato expiry not applied to user status: illegal transition', [
+                    'verification_id' => $verification->id,
+                    'user_id'         => $user->id,
+                    'kyc_status'      => $user->kyc_status,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
         }
 
         Log::info('Ondato verification expired', [
@@ -597,13 +646,17 @@ class OndatoService
     /**
      * Move the verification to $to only while its status is one of $from, in
      * one conditional update, so two webhooks processed at the same time
-     * cannot both apply and a final status is never moved back.
+     * cannot both apply and a final status is never moved back. Every
+     * applied move writes an AuditLog row — a webhook-driven verification
+     * transition is a KYC decision and must be reconstructible.
      *
      * @param  list<string>  $from
      * @param  array<model-property<KycVerification>, mixed>  $attributes
      */
     private function transition(KycVerification $verification, array $from, string $to, array $attributes, string $action): bool
     {
+        $oldStatus = $verification->status;
+
         $moved = KycVerification::query()
             ->whereKey($verification->getKey())
             ->whereIn('status', $from)
@@ -621,6 +674,15 @@ class OndatoService
         }
 
         $verification->refresh();
+
+        AuditLog::log(
+            'kyc.verification_transition',
+            $verification->user,
+            ['verification_status' => $oldStatus],
+            ['verification_status' => $to],
+            ['verification_id'     => $verification->getKey(), 'provider' => 'ondato', 'action' => $action],
+            'kyc,compliance,verification'
+        );
 
         return true;
     }

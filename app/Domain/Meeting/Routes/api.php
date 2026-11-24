@@ -11,6 +11,7 @@ Route::prefix('v1/meetings')->name('api.meetings.')->middleware(['auth:sanctum']
     Route::get('/availability', [MeetingController::class, 'availability'])->name('availability');
     Route::get('/{meeting}', [MeetingController::class, 'show'])->name('show');
     Route::post('/{meeting}/cancel', [MeetingController::class, 'cancel'])->name('cancel');
+    Route::post('/{meeting}/respond', [MeetingController::class, 'respond'])->name('respond');
     Route::post('/{meeting}/reschedule', [MeetingController::class, 'reschedule'])->name('reschedule');
     Route::post('/{meeting}/join', [MeetingController::class, 'join'])->name('join');
     Route::get('/{meeting}/messages', [MeetingController::class, 'messages'])->name('messages.index');

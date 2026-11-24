@@ -128,19 +128,17 @@ class OrderBook extends AggregateRoot
 
         if ($event->type === 'buy') {
             $this->buyOrders->push($order);
-            $this->buyOrders = $this->buyOrders->sortByDesc(
-                function ($order) {
-                    return $order['price']->__toString();
-                }
+            // Exact decimal ordering: sorting the string forms would put
+            // '9000' after '10000' and corrupt bestBid.
+            $this->buyOrders = $this->buyOrders->sort(
+                fn ($a, $b) => $b['price']->compareTo($a['price'])
             )->values();
 
             $this->bestBid = $this->buyOrders->first()['price'] ?? null;
         } else {
             $this->sellOrders->push($order);
-            $this->sellOrders = $this->sellOrders->sortBy(
-                function ($order) {
-                    return $order['price']->__toString();
-                }
+            $this->sellOrders = $this->sellOrders->sort(
+                fn ($a, $b) => $a['price']->compareTo($b['price'])
             )->values();
 
             $this->bestAsk = $this->sellOrders->first()['price'] ?? null;

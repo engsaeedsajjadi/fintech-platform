@@ -32,8 +32,15 @@ final class FedNowService
     /**
      * Send an instant payment via FedNow using ISO 20022 Pacs.008.
      *
+     * There is no live FedNow transmission endpoint: the Pacs.008 message
+     * is built locally and the instruction is recorded ONLY in simulation
+     * mode (see {@see RailTransmissionGate}) with status INITIATED and
+     * `transmitted: false`. Outside simulation mode this throws
+     * {@see RailUnavailableException} and creates no row.
+     *
      * @throws InvalidArgumentException when amount exceeds the configured maximum
-     * @return array{transaction_id: string, external_id: string, status: string, rail: string, amount: string, currency: string, iso20022_message_id: string}
+     * @throws \App\Domain\PaymentRails\Exceptions\RailUnavailableException when the rail cannot transmit
+     * @return array{transaction_id: string, external_id: string, status: string, rail: string, amount: string, currency: string, iso20022_message_id: string, transmitted: bool, simulation: bool}
      */
     public function sendInstantPayment(
         int $userId,
@@ -44,6 +51,8 @@ final class FedNowService
         string $creditorBic,
         ?string $reference = null,
     ): array {
+        RailTransmissionGate::ensureSimulationAllowed('FedNow', 'fednow');
+
         $maxAmount = (int) config('payment_rails.fednow.max_amount', 50000000);
 
         if (! is_numeric($amount)) {
@@ -89,9 +98,11 @@ final class FedNowService
             'external_id' => $externalId,
             'amount'      => $amount,
             'currency'    => $currency,
-            'status'      => RailStatus::PROCESSING,
-            'direction'   => 'debit',
-            'metadata'    => [
+            // INITIATED, not PROCESSING: the message was built locally and
+            // NOT transmitted to the network (simulation only).
+            'status'    => RailStatus::INITIATED,
+            'direction' => 'debit',
+            'metadata'  => [
                 'creditor_name'  => $creditorName,
                 'creditor_iban'  => $creditorIban,
                 'creditor_bic'   => $creditorBic,
@@ -101,17 +112,21 @@ final class FedNowService
                 'uetr'           => $uetr,
                 'iso20022_xml'   => $xmlMessage,
                 'participant_id' => $participantId,
+                'transmitted'    => false,
+                'simulation'     => true,
             ],
         ]);
 
         return [
             'transaction_id'      => $transaction->id,
             'external_id'         => $externalId,
-            'status'              => RailStatus::PROCESSING->value,
+            'status'              => RailStatus::INITIATED->value,
             'rail'                => PaymentRail::FEDNOW->value,
             'amount'              => $amount,
             'currency'            => $currency,
             'iso20022_message_id' => $messageId,
+            'transmitted'         => false,
+            'simulation'          => true,
         ];
     }
 

@@ -49,7 +49,13 @@ final class KycVerificationWorkflowService
         private readonly ?IdentityVerificationProviderInterface $livenessProvider = null,
         private readonly ?BankAccountOwnershipVerifierInterface $bankAccountVerifier = null,
         private readonly ?KycAmlMonitoringService $amlMonitoringService = null,
+        private readonly ?KycStatusMachine $statusMachine = null,
     ) {
+    }
+
+    private function statusMachine(): KycStatusMachine
+    {
+        return $this->statusMachine ?? new KycStatusMachine();
     }
 
     private function liveness(): IdentityVerificationProviderInterface
@@ -128,7 +134,8 @@ final class KycVerificationWorkflowService
             ]);
 
             if (($user->kyc_status ?? 'not_submitted') === 'not_submitted') {
-                $user->update(['kyc_status' => 'pending', 'kyc_submitted_at' => now()]);
+                $this->statusMachine()->submit($user, 'user:' . $user->id);
+                $user->update(['kyc_submitted_at' => now()]);
             }
 
             AuditLog::log(
@@ -164,7 +171,8 @@ final class KycVerificationWorkflowService
                 ],
             ]);
 
-            $user->update(['kyc_status' => 'pending', 'kyc_submitted_at' => now()]);
+            $this->statusMachine()->submit($user, 'user:' . $user->id);
+            $user->update(['kyc_submitted_at' => now()]);
 
             AuditLog::log(
                 'kyc.document_uploaded',

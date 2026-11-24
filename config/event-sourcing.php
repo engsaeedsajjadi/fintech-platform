@@ -5,6 +5,12 @@ return [
     /*
      * These directories will be scanned for projectors and reactors. They
      * will be registered to Projectionist automatically.
+     *
+     * NOTE (Phase 4.2-A): only classes extending Spatie's Projector/Reactor
+     * (i.e. EventHandler) are registered. A plain listener class in one of
+     * these directories is silently ignored — that is how
+     * PostGlEntryListener (app/Domain/Ledger/Listeners) used to be dead
+     * code: it is a Reactor now, so discovery picks it up.
      */
     'auto_discover_projectors_and_reactors' => array_values(array_filter(
         array_merge(

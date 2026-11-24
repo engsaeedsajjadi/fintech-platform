@@ -9,6 +9,7 @@ use App\Domain\Exchange\Events\OrderMatched;
 use App\Domain\Exchange\Events\OrderRemovedFromBook;
 use App\Domain\Exchange\Projections\OrderBook;
 use App\Domain\Exchange\Projections\Trade;
+use Brick\Math\BigDecimal;
 use Spatie\EventSourcing\EventHandlers\Projectors\Projector;
 
 class OrderBookProjector extends Projector
@@ -54,8 +55,12 @@ class OrderBookProjector extends Projector
             }
             $buyOrders->push($order);
 
-            // Sort buy orders by price descending (highest first)
-            $buyOrders = $buyOrders->sortByDesc('price')->values();
+            // Sort buy orders by price descending (highest first).
+            // Exact decimal comparison: string sorting would order
+            // '9000' after '10000' ('9' > '1'), corrupting best_bid.
+            $buyOrders = $buyOrders->sort(
+                fn ($a, $b) => BigDecimal::of((string) $b['price'])->compareTo(BigDecimal::of((string) $a['price']))
+            )->values();
 
             $orderBook->update(
                 [
@@ -71,8 +76,12 @@ class OrderBookProjector extends Projector
             }
             $sellOrders->push($order);
 
-            // Sort sell orders by price ascending (lowest first)
-            $sellOrders = $sellOrders->sortBy('price')->values();
+            // Sort sell orders by price ascending (lowest first).
+            // Exact decimal comparison: string sorting would order
+            // '10000' before '9000' ('1' < '9'), corrupting best_ask.
+            $sellOrders = $sellOrders->sort(
+                fn ($a, $b) => BigDecimal::of((string) $a['price'])->compareTo(BigDecimal::of((string) $b['price']))
+            )->values();
 
             $orderBook->update(
                 [

@@ -279,7 +279,10 @@ final class NachaFileGenerator
     }
 
     /**
-     * Convert a decimal dollar string to integer cents.
+     * Convert a decimal dollar string to integer cents, exactly.
+     *
+     * (float) $amount * 100 loses cents at the boundary (0.29 * 100 is
+     * 28.999... in binary); bcmath keeps the file totals exact.
      *
      * @param string|int|float|null $amount
      */
@@ -289,7 +292,9 @@ final class NachaFileGenerator
             return 0;
         }
 
-        return (int) round((float) $amount * 100);
+        $decimal = \App\Support\DecimalString::fromNumeric($amount, 4) ?? '0.0000';
+
+        return (int) bcmul($decimal, '100', 0);
     }
 
     /**

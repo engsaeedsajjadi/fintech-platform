@@ -95,6 +95,7 @@ class IntelligentRoutingService
     /**
      * Select the optimal payment rail for the given parameters.
      *
+     * @param numeric-string $amount Exact decimal string in major units.
      * @return array{recommended_rail: string, score: float, alternatives: array<int, array{rail: string, score: float}>, decision_factors: array<string, mixed>}
      */
     public function selectOptimalRail(
@@ -103,7 +104,6 @@ class IntelligentRoutingService
         string $country,
         string $urgency = 'normal',
     ): array {
-        $amountFloat = (float) $amount;
         $scores = [];
 
         foreach (array_keys(self::RAIL_CONFIG) as $rail) {
@@ -114,8 +114,8 @@ class IntelligentRoutingService
                 continue;
             }
 
-            // Skip rails outside amount limits
-            if ($amountFloat < $config['min'] || $amountFloat > $config['max']) {
+            // Skip rails outside amount limits (exact decimal comparison).
+            if (bccomp($amount, (string) $config['min'], 4) === -1 || bccomp($amount, (string) $config['max'], 4) === 1) {
                 continue;
             }
 
@@ -306,11 +306,17 @@ class IntelligentRoutingService
 
     /**
      * Estimate the fee for a given rail, amount, and currency.
+     *
+     * The return value is a SCORING estimate (a float used only to rank
+     * rails), never money moved or charged. The threshold and surcharge
+     * are still computed exactly with bcmath so a boundary amount is
+     * never misclassified by binary rounding.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
      */
     public function getCostEstimate(string $rail, string $amount, string $currency): float
     {
         $config = self::RAIL_CONFIG[$rail] ?? null;
-        $amountFloat = (float) $amount;
 
         if ($config === null) {
             return self::MAX_COST;
@@ -319,8 +325,8 @@ class IntelligentRoutingService
         $base = $config['baseCost'];
 
         // Percentage-based surcharge for large SWIFT / Fedwire transfers
-        if (in_array($rail, ['SWIFT', 'FEDWIRE'], true) && $amountFloat > 10000) {
-            $base += $amountFloat * 0.0002; // 0.02% surcharge
+        if (in_array($rail, ['SWIFT', 'FEDWIRE'], true) && bccomp($amount, '10000', 4) === 1) {
+            $base += (float) bcmul($amount, '0.0002', 4); // 0.02% surcharge
         }
 
         return round($base, 4);

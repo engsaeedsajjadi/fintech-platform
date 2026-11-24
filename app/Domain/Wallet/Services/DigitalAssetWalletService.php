@@ -9,6 +9,7 @@ use App\Domain\Account\DataObjects\Money;
 use App\Domain\Account\Models\AccountBalance;
 use App\Domain\Asset\Aggregates\AssetTransactionAggregate;
 use App\Domain\Asset\Models\Asset;
+use App\Domain\Asset\ValueObjects\CurrencyPrecisionRegistry;
 use App\Domain\KeyManagement\Services\CustodialKeyGate;
 use App\Domain\Wallet\Contracts\BlockchainProviderInterface;
 use App\Domain\Wallet\Exceptions\InsufficientBalanceException;
@@ -475,9 +476,20 @@ final class DigitalAssetWalletService
         }
     }
 
+    /**
+     * Precision of an asset: the registered `assets` row first, then the
+     * canonical currency registry (LedgerPrecision-backed). The old
+     * hardcoded fallback of 8 mis-scaled every unregistered asset (e.g.
+     * USDT at 8 instead of 6 — balances displayed 100x off).
+     */
     private function precisionOf(string $assetCode): int
     {
-        return (int) (Asset::query()->where('code', strtoupper($assetCode))->value('precision') ?? 8);
+        $row = Asset::query()->where('code', strtoupper($assetCode))->value('precision');
+        if ($row !== null) {
+            return (int) $row;
+        }
+
+        return CurrencyPrecisionRegistry::for($assetCode)->minorUnitExponent;
     }
 
     private function lockWithdrawal(string $withdrawalUuid): DigitalAssetWithdrawal

@@ -6,10 +6,13 @@ namespace App\Domain\Ledger\Services;
 
 use App\Domain\Ledger\Contracts\LedgerDriverInterface;
 use App\Domain\Ledger\Enums\ReconciliationStatus;
+use App\Domain\Ledger\Models\JournalEntry;
+use App\Domain\Ledger\Models\LedgerDriverSync;
 use App\Domain\Ledger\Models\ReconciliationReport;
 use App\Domain\Ledger\ValueObjects\DecimalMath;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Collection;
+use Throwable;
 
 final class ReconciliationService
 {
@@ -163,6 +166,62 @@ final class ReconciliationService
                 'amount_mismatches' => $comparison['amount_mismatches'],
             ], JSON_THROW_ON_ERROR),
         ]);
+    }
+
+    /**
+     * Retry pending external-driver syncs from the outbox.
+     *
+     * The DB journal is authoritative: a sync row only ever exists because
+     * a previous driver->post() failed after the journal commit. Each entry
+     * is re-sent with the same deterministic transfer ids (TigerBeetle
+     * deduplicates), so a retry cannot double-post. A row is marked synced
+     * only after the driver confirms; failures stay pending with an
+     * incremented attempt count and the last error.
+     *
+     * @return array{retried: int, synced: int, failed: int}
+     */
+    public function retryPendingDriverSyncs(int $limit = 50): array
+    {
+        $pending = LedgerDriverSync::where('status', 'pending')
+            ->orderBy('created_at')
+            ->limit($limit)
+            ->get();
+
+        $synced = 0;
+        $failed = 0;
+
+        foreach ($pending as $row) {
+            $entry = JournalEntry::with('lines')->find($row->journal_entry_id);
+
+            if ($entry === null) {
+                $row->update([
+                    'status'     => 'failed',
+                    'last_error' => 'Journal entry no longer exists; cannot sync.',
+                ]);
+                $failed++;
+                continue;
+            }
+
+            try {
+                $this->driver->post($entry);
+            } catch (Throwable $e) {
+                $row->update([
+                    'attempts'   => $row->attempts + 1,
+                    'last_error' => mb_substr($e->getMessage(), 0, 2000),
+                ]);
+                $failed++;
+                continue;
+            }
+
+            $row->update([
+                'status'     => 'synced',
+                'synced_at'  => Carbon::now(),
+                'last_error' => null,
+            ]);
+            $synced++;
+        }
+
+        return ['retried' => count($pending), 'synced' => $synced, 'failed' => $failed];
     }
 
     /**

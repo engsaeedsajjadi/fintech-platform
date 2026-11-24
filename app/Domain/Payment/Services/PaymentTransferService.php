@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace App\Domain\Payment\Services;
 
+use App\Domain\Ledger\Enums\AccountType;
 use App\Domain\Ledger\Enums\TransactionState;
+use App\Domain\Ledger\Models\LedgerAccount;
 use App\Domain\Ledger\Services\LedgerService;
 use App\Domain\Ledger\ValueObjects\DecimalMath;
+use App\Domain\Ledger\ValueObjects\MoneyAmount;
 use App\Domain\Payment\Events\TransferRequiresManualReview;
 use App\Domain\Payment\Events\TransferReversed;
 use App\Domain\Payment\Exceptions\ProviderTimeoutException;
@@ -24,6 +27,18 @@ use Throwable;
  *
  * Flow (no provider — internal transfer):
  *   validate → post guarded entry sender → recipient → successful + receipt
+ *
+ * Fee model (Phase 4.2): the transfer fee is carved OUT of the amount
+ * (TransferFeeCalculator's net_minor), never charged on top and never left
+ * as metadata-only. The principal entry moves the NET amount
+ * sender → recipient, and the fee moves in a SEPARATE, idempotent entry
+ * (`transfer-fee:{reference}`) from the sender (or the hold, on the
+ * provider path) to the `PAYMENT:FEES:{currency}` control account. The
+ * sender's total outflow is still the gross amount, the recipient receives
+ * the net amount, and the fee value is conserved in the ledger instead of
+ * vanishing. The control account is an asset holding collected fees;
+ * recognising it as fee income is a finance month-end sweep, not an
+ * automatic posting (see postFeeEntry()).
  *
  * Flow (with a provider call):
  *   validate → reserve (guarded entry sender → hold account) → call provider
@@ -113,21 +128,28 @@ final class PaymentTransferService
         );
 
         if ($providerCall === null) {
+            // Principal entry moves the NET amount (gross minus fee); the
+            // fee itself moves in a separate entry (postFeeEntry). With a
+            // zero fee, net == gross and this is exactly the old entry.
+            $net = MoneyAmount::fromMinorUnits($fee['net_minor'], $currency);
+
             $entry = $this->ledger->postGuarded(
                 "Transfer {$transaction->reference}",
                 [
-                    ['account_code' => $senderAccountCode, 'debit' => '0.0000', 'credit' => $amount->decimal],
-                    ['account_code' => $recipientAccountCode, 'debit' => $amount->decimal, 'credit' => '0.0000'],
+                    ['account_code' => $senderAccountCode, 'debit' => '0.0000', 'credit' => $net->decimal, 'currency' => $currency],
+                    ['account_code' => $recipientAccountCode, 'debit' => $net->decimal, 'credit' => '0.0000', 'currency' => $currency],
                 ],
                 [$senderAccountCode],
                 'Payment',
                 $transaction->reference,
             );
 
-            $this->mark($transaction, TransactionState::SUCCESSFUL, [
+            $feeMetadata = $this->postFeeEntrySafely($senderAccountCode, $fee, $currency, $transaction->reference);
+
+            $this->mark($transaction, TransactionState::SUCCESSFUL, array_merge([
                 'settlement_entry_id' => $entry->id,
                 'completed_at'        => now()->toIso8601String(),
-            ]);
+            ], $feeMetadata));
             $this->receipts->issue($transaction->refresh(), $entry->id);
 
             return $transaction->refresh();
@@ -253,7 +275,7 @@ final class PaymentTransferService
         PaymentTransaction $transaction,
         callable $providerCall,
         ?string $holdAccountCode,
-        \App\Domain\Ledger\ValueObjects\MoneyAmount $amount,
+        MoneyAmount $amount,
         string $senderAccountCode,
         string $recipientAccountCode,
         string $currency,
@@ -339,26 +361,131 @@ final class PaymentTransferService
             throw new RuntimeException("Cannot settle transfer {$transaction->reference}: recipient missing from metadata.");
         }
 
-        $amount = \App\Domain\Ledger\ValueObjects\MoneyAmount::fromMinorUnits((int) $transaction->amount, $currency);
+        $feeMinor = (int) ($metadata['fee_minor'] ?? 0);
+        $feeDecimal = (string) ($metadata['fee_decimal'] ?? '0');
+        $net = MoneyAmount::fromMinorUnits(
+            (int) $transaction->amount - $feeMinor,
+            $currency,
+        );
 
         $entry = $this->ledger->postGuarded(
             "Transfer settlement {$transaction->reference}",
             [
-                ['account_code' => $holdAccountCode, 'debit' => '0.0000', 'credit' => $amount->decimal],
-                ['account_code' => $recipientAccountCode, 'debit' => $amount->decimal, 'credit' => '0.0000'],
+                ['account_code' => $holdAccountCode, 'debit' => '0.0000', 'credit' => $net->decimal, 'currency' => $currency],
+                ['account_code' => $recipientAccountCode, 'debit' => $net->decimal, 'credit' => '0.0000', 'currency' => $currency],
             ],
             [$holdAccountCode],
             'Payment',
             $transaction->reference,
         );
 
-        $this->mark($transaction, TransactionState::SUCCESSFUL, [
+        // The fee is collected from the hold (which still holds the gross
+        // reservation) in its own entry; the hold ends at zero either way.
+        $feeMetadata = $this->postFeeEntrySafely($holdAccountCode, [
+            'fee_minor'   => $feeMinor,
+            'fee_decimal' => $feeDecimal,
+            'net_minor'   => (int) $transaction->amount - $feeMinor,
+            'gross_minor' => (int) $transaction->amount,
+        ], $currency, $transaction->reference);
+
+        $this->mark($transaction, TransactionState::SUCCESSFUL, array_merge([
             'settlement_entry_id' => $entry->id,
             'completed_at'        => now()->toIso8601String(),
-        ]);
+        ], $feeMetadata));
         $this->receipts->issue($transaction->refresh(), $entry->id);
 
         return $transaction->refresh();
+    }
+
+    /**
+     * Post the transfer fee as its own balanced entry, idempotent on the
+     * transfer reference. The fee is collected from $fromAccountCode
+     * (sender, or the hold on the provider path) into the
+     * `PAYMENT:FEES:{currency}` control account, an ASSET holding collected
+     * fees.
+     *
+     * Why an asset control account and not a fee-income (revenue) credit:
+     * this service's principal entries are asset-style (the sender is
+     * credited, i.e. its asset decreases), so the matching fee debit must
+     * be a platform asset — crediting fee income here would need a second
+     * debit of the same value and create money from nothing. Finance
+     * recognises the control-account balance as fee income in the month-end
+     * sweep; the value itself is conserved and auditable from this entry.
+     *
+     * @param array{fee_minor: int, fee_decimal: string, net_minor: int, gross_minor: int} $fee
+     */
+    private function postFeeEntry(
+        string $fromAccountCode,
+        array $fee,
+        string $currency,
+        string $reference,
+    ): string {
+        $feeDecimal = (string) $fee['fee_decimal'];
+        $feeAccountCode = (string) config(
+            'payment_rails.transfers.fee_account_code',
+            'PAYMENT:FEES:' . $currency,
+        );
+
+        LedgerAccount::firstOrCreate(
+            ['code' => $feeAccountCode],
+            [
+                'name'      => "Transfer fees collected {$currency}",
+                'type'      => AccountType::ASSET,
+                'currency'  => $currency,
+                'is_active' => true,
+            ],
+        );
+
+        $entry = $this->ledger->postIdempotent(
+            'transfer-fee:' . $reference,
+            "Transfer fee {$reference}",
+            [
+                ['account_code' => $feeAccountCode, 'debit' => $feeDecimal, 'credit' => '0.0000', 'currency' => $currency, 'narrative' => "Transfer fee {$reference}"],
+                ['account_code' => $fromAccountCode, 'debit' => '0.0000', 'credit' => $feeDecimal, 'currency' => $currency, 'narrative' => "Transfer fee {$reference}"],
+            ],
+            'Payment',
+            $reference,
+        );
+
+        return $entry->id;
+    }
+
+    /**
+     * Fee posting that never fails the transfer: the principal entry is
+     * already committed when the fee is posted, so a fee failure is
+     * flagged in the transaction metadata (`fee_entry_status: pending`)
+     * for operator retry — the fee entry is idempotent, so retrying it is
+     * safe — instead of failing a transfer whose money already moved.
+     *
+     * @param array{fee_minor: int, fee_decimal: string, net_minor: int, gross_minor: int} $fee
+     * @return array<string, mixed>
+     */
+    private function postFeeEntrySafely(
+        string $fromAccountCode,
+        array $fee,
+        string $currency,
+        string $reference,
+    ): array {
+        if ((int) $fee['fee_minor'] <= 0) {
+            return [];
+        }
+
+        try {
+            return [
+                'fee_entry_id'     => $this->postFeeEntry($fromAccountCode, $fee, $currency, $reference),
+                'fee_entry_status' => 'posted',
+            ];
+        } catch (Throwable $e) {
+            Log::error('Transfer fee entry failed — flagged pending, principal already posted', [
+                'reference' => $reference,
+                'error'     => $e->getMessage(),
+            ]);
+
+            return [
+                'fee_entry_status' => 'pending',
+                'fee_error'        => mb_substr($e->getMessage(), 0, 500),
+            ];
+        }
     }
 
     private function markUnknown(PaymentTransaction $transaction, string $reason): PaymentTransaction

@@ -245,6 +245,18 @@ return [
         'fee_bps'          => (int) env('WALLET_CONVERSION_FEE_BPS', 50),
         'fee_minor_fixed'  => 0,
         'max_slippage_bps' => (int) env('WALLET_CONVERSION_MAX_SLIPPAGE_BPS', 100),
+        // A quote priced from a sandbox/mock rate provider may only settle
+        // while this is on — on by default in local / testing / demo, off
+        // in production and staging unless an operator opts in explicitly
+        // with WALLET_CONVERSION_ALLOW_SANDBOX_PROVIDER=true. A
+        // sandbox-priced quote is labelled `mock:sandbox` on the quote
+        // itself; a production quote from the mock provider is refused
+        // fail-closed (RateUnavailableException) instead of settling at
+        // an invented rate.
+        'allow_sandbox_provider' => (bool) env(
+            'WALLET_CONVERSION_ALLOW_SANDBOX_PROVIDER',
+            in_array(env('APP_ENV', 'production'), ['local', 'testing', 'demo'], true),
+        ),
     ],
 
     /*--------------------------------------------------------------------------

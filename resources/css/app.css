@@ -509,3 +509,22 @@
     from { opacity: 0; transform: translateY(8px); }
     to { opacity: 1; transform: translateY(0); }
 }
+
+/* ── RTL / Persian locale ─────────────────────────────────────────── */
+/* The <html> element carries dir="rtl" for fa (see layouts). Persian
+   text must never sit inside an LTR layout: these rules give RTL pages
+   a readable Persian-capable font stack and keep machine-readable
+   inputs (datetime, numbers, URLs) left-to-right. */
+html[dir="rtl"] body {
+    font-family: Tahoma, 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+html[dir="rtl"] input[type="datetime-local"],
+html[dir="rtl"] input[type="date"],
+html[dir="rtl"] input[type="time"],
+html[dir="rtl"] input[type="number"],
+html[dir="rtl"] input[type="url"],
+html[dir="rtl"] input[type="email"] {
+    direction: ltr;
+    text-align: left;
+}

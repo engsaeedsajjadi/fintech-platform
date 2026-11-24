@@ -77,6 +77,9 @@ interface IBankIntegrationService
 
     /**
      * Initiate a transfer between banks.
+     *
+     * Legacy float boundary — converted to an exact decimal string
+     * immediately. New callers must use initiateInterBankTransferExact().
      */
     public function initiateInterBankTransfer(
         User $user,
@@ -90,11 +93,40 @@ interface IBankIntegrationService
     ): BankTransfer;
 
     /**
+     * Exact-amount inter-bank transfer. Provider calls run outside any
+     * DB transaction; only the local transfer record is transactional.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
+     * @param array<string, mixed> $metadata
+     */
+    public function initiateInterBankTransferExact(
+        User $user,
+        string $fromBankCode,
+        string $fromAccountId,
+        string $toBankCode,
+        string $toAccountId,
+        string $amount,
+        string $currency,
+        array $metadata = []
+    ): BankTransfer;
+
+    /**
      * Get optimal bank for a transaction.
+     *
+     * Legacy float boundary — converted to an exact decimal string
+     * immediately. New callers must use getOptimalBankExact().
      *
      * @return string Bank code
      */
     public function getOptimalBank(User $user, string $currency, float $amount, string $transferType): string;
+
+    /**
+     * Exact-amount optimal-bank selection.
+     *
+     * @param numeric-string $amount Exact decimal string in major units.
+     * @return string Bank code
+     */
+    public function getOptimalBankExact(User $user, string $currency, string $amount, string $transferType): string;
 
     /**
      * Check bank health status.
@@ -105,6 +137,15 @@ interface IBankIntegrationService
 
     /**
      * Get aggregated balance across all banks.
+     *
+     * Legacy float API — lossy by nature. New callers must use
+     * getAggregatedBalanceExact().
      */
     public function getAggregatedBalance(User $user, string $currency): float;
+
+    /**
+     * Exact aggregated balance across all banks, as a decimal string in
+     * major units (bcmath sum, never a float artefact).
+     */
+    public function getAggregatedBalanceExact(User $user, string $currency): string;
 }

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Domain\Asset\Models;
 
 use App\Domain\Shared\Traits\UsesTenantConnection;
+use Brick\Math\BigDecimal;
+use Brick\Math\RoundingMode;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -108,6 +110,13 @@ class ExchangeRate extends Model
     public const SOURCE_MARKET = 'market';
 
     /**
+     * Sandbox fixture rate: a hardcoded / mock rate, never a live market
+     * price. Stored only while the sandbox rate source is enabled (see
+     * config/asset.php); consumers must treat it as labelled test data.
+     */
+    public const SOURCE_SANDBOX = 'sandbox_mock';
+
+    /**
      * Get all valid sources.
      *
      * @return array<string>
@@ -119,6 +128,7 @@ class ExchangeRate extends Model
             self::SOURCE_API,
             self::SOURCE_ORACLE,
             self::SOURCE_MARKET,
+            self::SOURCE_SANDBOX,
         ];
     }
 
@@ -141,12 +151,19 @@ class ExchangeRate extends Model
     /**
      * Convert an amount from the base asset to the target asset.
      *
+     * Exact decimal arithmetic (Brick BigDecimal): the previous
+     * `(int) round($amount * (float) $this->rate)` lost integer precision
+     * above 2^53 and rounded through binary float. Half-up to a whole
+     * minor unit, matching the old rounding direction for normal values.
+     *
      * @param  int  $amount  Amount in smallest unit
      * @return int Converted amount in smallest unit
      */
     public function convert(int $amount): int
     {
-        return (int) round($amount * (float) $this->rate);
+        return (int) (string) BigDecimal::of((string) $amount)
+            ->multipliedBy(BigDecimal::of((string) $this->rate))
+            ->toScale(0, RoundingMode::HALF_UP);
     }
 
     /**

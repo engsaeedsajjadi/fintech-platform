@@ -33,6 +33,14 @@ class DocumentAnalysisService
 
     /**
      * Extract data from identity document.
+     *
+     * Simulated — and a simulated extractor cannot establish identity:
+     * the old version returned a fabricated identity (John Doe, DOB
+     * 1990-01-01, random document number, MRZ) for every document type,
+     * and EnhancedKycService stored those values on the verification
+     * record as if they were the user's real identity. Removed: no
+     * personal data is returned at all — only the document type and a
+     * zero confidence, labelled sandbox / requires_manual_review.
      */
     public function extractDocumentData(string $documentPath, string $documentType): array
     {
@@ -41,76 +49,20 @@ class DocumentAnalysisService
             return $this->gate->failClosedDocument($documentType);
         }
 
-        // In production, this would use OCR and document analysis services
-        // For demonstration, simulate data extraction
-
-        $extractedData = [
+        return array_merge([
             'document_type'         => $documentType,
-            'extraction_confidence' => 95.5,
-            'extracted_at'          => now()->toIso8601String(),
-        ];
-
-        switch ($documentType) {
-            case 'passport':
-                $extractedData = array_merge(
-                    $extractedData,
-                    [
-                        'document_number' => 'P' . rand(100000000, 999999999),
-                        'first_name'      => 'John',
-                        'last_name'       => 'Doe',
-                        'date_of_birth'   => '1990-01-01',
-                        'gender'          => 'M',
-                        'nationality'     => 'US',
-                        'issuing_country' => 'US',
-                        'issue_date'      => '2020-01-15',
-                        'expiry_date'     => '2030-01-14',
-                        'mrz'             => 'P<USADOE<<JOHN<<<<<<<<<<<<<<<<<<<<<<<<<<<<',
-                    ]
-                );
-                break;
-
-            case 'driving_license':
-                $extractedData = array_merge(
-                    $extractedData,
-                    [
-                        'document_number' => 'DL' . rand(1000000, 9999999),
-                        'first_name'      => 'John',
-                        'last_name'       => 'Doe',
-                        'middle_name'     => 'Michael',
-                        'date_of_birth'   => '1990-01-01',
-                        'gender'          => 'M',
-                        'address'         => '123 Main St, Anytown, ST 12345',
-                        'issuing_state'   => 'CA',
-                        'issue_date'      => '2021-06-01',
-                        'expiry_date'     => '2025-06-01',
-                        'class'           => 'C',
-                    ]
-                );
-                break;
-
-            case 'national_id':
-                $extractedData = array_merge(
-                    $extractedData,
-                    [
-                        'document_number' => 'ID' . rand(100000000, 999999999),
-                        'first_name'      => 'John',
-                        'last_name'       => 'Doe',
-                        'date_of_birth'   => '1990-01-01',
-                        'gender'          => 'M',
-                        'nationality'     => 'US',
-                        'address'         => '123 Main St, Anytown, ST 12345',
-                        'issue_date'      => '2019-03-15',
-                        'expiry_date'     => '2029-03-14',
-                    ]
-                );
-                break;
-        }
-
-        return array_merge($extractedData, $this->sandboxLabel());
+            'extraction_confidence' => 0.0,
+            'extracted_at'          => null,
+        ], $this->sandboxLabel());
     }
 
     /**
      * Extract address data from document.
+     *
+     * Simulated — the old version returned a fabricated address and
+     * account holder ("John Doe", 123 Main Street) for every document
+     * type. Removed: no address data is returned; a real address comes
+     * from a real provider or a human reviewer reading the document.
      */
     public function extractAddressData(string $documentPath, string $documentType): array
     {
@@ -127,57 +79,19 @@ class DocumentAnalysisService
             ];
         }
 
-        // In production, this would use OCR to extract address information
-        // For demonstration, simulate data extraction
-
-        $addressData = [];
-
-        switch ($documentType) {
-            case 'utility_bill':
-                $addressData = [
-                    'line1'          => '123 Main Street',
-                    'line2'          => 'Apt 4B',
-                    'city'           => 'Anytown',
-                    'state'          => 'CA',
-                    'postal_code'    => '12345',
-                    'country'        => 'US',
-                    'bill_date'      => now()->subMonth()->toDateString(),
-                    'account_holder' => 'John Doe',
-                ];
-                break;
-
-            case 'bank_statement':
-                $addressData = [
-                    'line1'          => '123 Main Street',
-                    'line2'          => 'Apt 4B',
-                    'city'           => 'Anytown',
-                    'state'          => 'CA',
-                    'postal_code'    => '12345',
-                    'country'        => 'US',
-                    'statement_date' => now()->subMonth()->toDateString(),
-                    'account_holder' => 'John Doe',
-                ];
-                break;
-
-            case 'lease_agreement':
-                $addressData = [
-                    'line1'       => '123 Main Street',
-                    'line2'       => 'Apt 4B',
-                    'city'        => 'Anytown',
-                    'state'       => 'CA',
-                    'postal_code' => '12345',
-                    'country'     => 'US',
-                    'lease_start' => now()->subMonths(6)->toDateString(),
-                    'tenant_name' => 'John Doe',
-                ];
-                break;
-        }
-
-        return array_merge($addressData, $this->sandboxLabel());
+        return array_merge([
+            'document_type' => $documentType,
+        ], $this->sandboxLabel());
     }
 
     /**
      * Verify document authenticity.
+     *
+     * Simulated — the old version returned `is_authentic: true` with a
+     * fabricated 94.2 confidence (every sub-check hardcoded to pass).
+     * Removed: a simulated authenticity check never passes, in any
+     * environment. Same shape as the gate's fail-closed payload, plus
+     * the sandbox label.
      */
     public function verifyAuthenticity(string $documentPath, string $documentType): array
     {
@@ -186,37 +100,13 @@ class DocumentAnalysisService
             return $this->gate->failClosedAuthenticity();
         }
 
-        // In production, this would use document verification services
-        // to check security features, holograms, watermarks, etc.
-
-        $checks = [
-            'is_authentic'     => true,
-            'confidence'       => 94.2,
+        return array_merge([
+            'is_authentic'     => false,
+            'confidence'       => 0.0,
             'checks_performed' => [],
-            'fraud_indicators' => false,
-            'data_consistency' => true,
-        ];
-
-        // Perform various authenticity checks
-        $checks['checks_performed'] = [
-            'format_validation'   => $this->validateDocumentFormat($documentType),
-            'security_features'   => $this->checkSecurityFeatures($documentType),
-            'data_consistency'    => $this->checkDataConsistency($documentType),
-            'image_quality'       => $this->assessImageQuality($documentPath),
-            'tampering_detection' => $this->detectTampering($documentPath),
-        ];
-
-        // Calculate overall authenticity
-        $passedChecks = array_filter($checks['checks_performed'], fn ($check) => $check['passed']);
-        $checks['confidence'] = (count($passedChecks) / count($checks['checks_performed'])) * 100;
-        $checks['is_authentic'] = $checks['confidence'] >= 80;
-
-        // Check for fraud indicators
-        if ($checks['confidence'] < 50) {
-            $checks['fraud_indicators'] = true;
-        }
-
-        return array_merge($checks, $this->sandboxLabel());
+            'fraud_indicators' => null,
+            'data_consistency' => false,
+        ], $this->sandboxLabel());
     }
 
     /**
@@ -376,6 +266,10 @@ class DocumentAnalysisService
 
     /**
      * Compare document with selfie.
+     *
+     * Simulated — the old version returned a fabricated match
+     * (confidence 87.3, liveness true). Removed: a simulated comparison
+     * never matches, in any environment.
      */
     public function compareDocumentWithSelfie(string $documentImagePath, string $selfiePath): array
     {
@@ -394,15 +288,14 @@ class DocumentAnalysisService
             ], $this->sandboxLabel());
         }
 
-        // In production, use facial recognition to compare
         return array_merge([
-            'match'      => true,
-            'confidence' => 87.3,
+            'match'      => false,
+            'confidence' => 0.0,
             'details'    => [
-                'face_detected_in_document' => true,
-                'face_detected_in_selfie'   => true,
-                'facial_similarity'         => 87.3,
-                'liveness_check'            => true,
+                'face_detected_in_document' => false,
+                'face_detected_in_selfie'   => false,
+                'facial_similarity'         => null,
+                'liveness_check'            => false,
             ],
         ], $this->sandboxLabel());
     }

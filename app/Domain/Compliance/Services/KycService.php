@@ -12,20 +12,26 @@ use InvalidArgumentException;
 
 class KycService
 {
+    private KycStatusMachine $statusMachine;
+
+    public function __construct(?KycStatusMachine $statusMachine = null)
+    {
+        $this->statusMachine = $statusMachine ?? new KycStatusMachine();
+    }
+
     /**
      * Submit KYC documents for a user.
+     *
+     * Moves the user to `pending` through KycStatusMachine (illegal from
+     * `approved`: an approved user cannot silently resubmit to pending).
      */
     public function submitKyc(User $user, array $documents): void
     {
         DB::transaction(
             function () use ($user, $documents) {
-                // Update user KYC status
-                $user->update(
-                    [
-                        'kyc_status'       => 'pending',
-                        'kyc_submitted_at' => now(),
-                    ]
-                );
+                // Update user KYC status (audited state transition).
+                $this->statusMachine->submit($user, 'user:' . $user->id);
+                $user->update(['kyc_submitted_at' => now()]);
 
                 // Store documents
                 foreach ($documents as $document) {
@@ -75,12 +81,27 @@ class KycService
 
     /**
      * Verify user KYC.
+     *
+     * Approval goes through KycStatusMachine: the caller must name a real
+     * basis — `provider_verdict` (a real provider's confirmed verdict) or
+     * `manual_review` (a human decision). The default is `manual_review`
+     * for the existing admin / manual-review callers; a simulated result
+     * is never an accepted basis and approval from a state other than
+     * `pending` (or `not_started` for an async provider verdict) throws
+     * instead of silently approving.
      */
     public function verifyKyc(User $user, string $verifiedBy, array $options = []): void
     {
         DB::transaction(
             function () use ($user, $verifiedBy, $options) {
                 $oldStatus = $user->kyc_status;
+
+                $this->statusMachine->approve(
+                    $user,
+                    $verifiedBy,
+                    $options['basis'] ?? KycStatusMachine::BASIS_MANUAL_REVIEW,
+                    ['level' => $options['level'] ?? 'enhanced']
+                );
 
                 // Update user status
                 $kycLevel = $options['level'] ?? 'enhanced';
@@ -90,7 +111,6 @@ class KycService
 
                 $user->update(
                     [
-                        'kyc_status'       => 'approved',
                         'kyc_approved_at'  => now(),
                         'kyc_expires_at'   => $options['expires_at'] ?? now()->addYears(2),
                         'kyc_level'        => $kycLevel,
@@ -124,6 +144,10 @@ class KycService
 
     /**
      * Reject user KYC.
+     *
+     * Rejection goes through KycStatusMachine (audited transition; a
+     * rejection may follow an approval — it takes access away — but never
+     * from an already-rejected or expired user).
      */
     public function rejectKyc(User $user, string $rejectedBy, string $reason): void
     {
@@ -131,13 +155,8 @@ class KycService
             function () use ($user, $rejectedBy, $reason) {
                 $oldStatus = $user->kyc_status;
 
-                // Update user status
-                $user->update(
-                    [
-                        'kyc_status'      => 'rejected',
-                        'kyc_rejected_at' => now(),
-                    ]
-                );
+                $this->statusMachine->reject($user, $rejectedBy, $reason);
+                $user->update(['kyc_rejected_at' => now()]);
 
                 // Mark documents as rejected
                 $user->kycDocuments()
@@ -162,21 +181,35 @@ class KycService
     }
 
     /**
+     * Expire a user's KYC through the state machine (audited transition).
+     * Used by provider webhooks when a verification expires while the
+     * user is still pending, and by checkExpiredKyc() below.
+     */
+    public function expireKyc(User $user, string $actor = 'system'): void
+    {
+        DB::transaction(function () use ($user, $actor) {
+            $oldStatus = $user->kyc_status;
+
+            $this->statusMachine->expire($user, $actor);
+
+            AuditLog::log(
+                'kyc.expired',
+                $user,
+                ['kyc_status' => $oldStatus],
+                ['kyc_status' => 'expired'],
+                ['actor'      => $actor],
+                'kyc,compliance,expired'
+            );
+        });
+    }
+
+    /**
      * Check if KYC is expired and update status.
      */
     public function checkExpiredKyc(User $user): bool
     {
         if ($user->kyc_status === 'approved' && $user->kyc_expires_at && $user->kyc_expires_at->isPast()) {
-            $user->update(['kyc_status' => 'expired']);
-
-            AuditLog::log(
-                'kyc.expired',
-                $user,
-                ['kyc_status' => 'approved'],
-                ['kyc_status' => 'expired'],
-                null,
-                'kyc,compliance,expired'
-            );
+            $this->expireKyc($user);
 
             return true;
         }

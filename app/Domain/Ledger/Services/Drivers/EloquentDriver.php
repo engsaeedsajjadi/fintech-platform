@@ -34,8 +34,76 @@ final class EloquentDriver implements LedgerDriverInterface
      * reversed entries would double-count the reversal (the original's
      * effect would vanish AND the mirror's inverse effect would apply).
      * Only DRAFT entries are excluded.
+     *
+     * Fail-closed (Phase 4.2-E): only lines in the account's own currency
+     * are summed — mixing currencies in one sum is not a balance. The
+     * returned currency is the account's currency, never a global default
+     * that could mislabel a EUR balance as USD.
+     *
+     * An account code with no chart row (e.g. trading virtual accounts,
+     * which Exchange posts to directly) still reports the sum of its
+     * journal lines — the DB read succeeded, so an empty sum is a real
+     * zero, not a fabricated one. The fabricated-zero failure this guards
+     * against is an UNAVAILABLE ledger (see TigerBeetleDriver, which
+     * throws LedgerUnavailableException instead of answering 0.0000).
+     * FiatWalletService and ConversionService both rely on this: they
+     * read a wallet balance before its account row is created.
      */
     public function balance(string $accountCode, ?Carbon $asOf = null): array
+    {
+        $account = LedgerAccount::where('code', $accountCode)->first();
+
+        if ($account === null) {
+            return $this->balanceWithoutChartRow($accountCode, $asOf);
+        }
+
+        $currency = (string) $account->currency;
+
+        $query = JournalLine::where('account_code', $accountCode)
+            ->where('currency', $currency)
+            ->whereHas('entry', function (Builder $q): void {
+                $q->whereIn('status', [EntryStatus::POSTED->value, EntryStatus::REVERSED->value]);
+            });
+
+        if ($asOf !== null) {
+            $query->whereHas('entry', function (Builder $q) use ($asOf): void {
+                $q->where('posted_at', '<=', $asOf);
+            });
+        }
+
+        $totals = $query->selectRaw('COALESCE(SUM(debit_amount), 0) as total_debit, COALESCE(SUM(credit_amount), 0) as total_credit')
+            ->first();
+
+        /** @var numeric-string $rawDebit */
+        $rawDebit = (string) ($totals->total_debit ?? '0');
+        /** @var numeric-string $rawCredit */
+        $rawCredit = (string) ($totals->total_credit ?? '0');
+        $totalDebit = bcadd($rawDebit, '0', 4);
+        $totalCredit = bcadd($rawCredit, '0', 4);
+
+        // For debit-normal accounts (assets, expenses): balance = debits - credits
+        // For credit-normal accounts (liabilities, equity, revenue): balance = credits - debits
+        if ($account->isDebitNormal()) {
+            $balance = bcsub($totalDebit, $totalCredit, 4);
+        } else {
+            $balance = bcsub($totalCredit, $totalDebit, 4);
+        }
+
+        return [
+            'amount'   => $balance,
+            'currency' => $currency,
+        ];
+    }
+
+    /**
+     * Balance for a code with no chart row: sum its journal lines as-is.
+     * Trading virtual accounts embed their currency in the code and are
+     * single-currency by construction, so no mixing can occur here. The
+     * currency is taken from the lines when any exist, else the default.
+     *
+     * @return array{amount: string, currency: string}
+     */
+    private function balanceWithoutChartRow(string $accountCode, ?Carbon $asOf = null): array
     {
         $query = JournalLine::where('account_code', $accountCode)
             ->whereHas('entry', function (Builder $q): void {
@@ -51,26 +119,23 @@ final class EloquentDriver implements LedgerDriverInterface
         $totals = $query->selectRaw('COALESCE(SUM(debit_amount), 0) as total_debit, COALESCE(SUM(credit_amount), 0) as total_credit')
             ->first();
 
-        $account = LedgerAccount::where('code', $accountCode)->first();
-
         /** @var numeric-string $rawDebit */
         $rawDebit = (string) ($totals->total_debit ?? '0');
         /** @var numeric-string $rawCredit */
         $rawCredit = (string) ($totals->total_credit ?? '0');
-        $totalDebit = bcadd($rawDebit, '0', 4);
-        $totalCredit = bcadd($rawCredit, '0', 4);
 
-        // For debit-normal accounts (assets, expenses): balance = debits - credits
-        // For credit-normal accounts (liabilities, equity, revenue): balance = credits - debits
-        if ($account !== null && $account->isDebitNormal()) {
-            $balance = bcsub($totalDebit, $totalCredit, 4);
-        } else {
-            $balance = bcsub($totalCredit, $totalDebit, 4);
-        }
+        $currency = (string) (JournalLine::where('account_code', $accountCode)->value('currency')
+            ?? config('ledger.default_currency', 'USD'));
 
         return [
-            'amount'   => $balance,
-            'currency' => (string) config('ledger.default_currency', 'USD'),
+            // No chart row means no normal-balance side is known. The
+            // historical convention for these codes is credit-normal
+            // (credits minus debits): wallet accounts created on the fly
+            // by ConversionService and trading virtual accounts are both
+            // read this way by existing consumers. Do not flip this sign
+            // without migrating those callers.
+            'amount'   => bcsub(bcadd($rawCredit, '0', 4), bcadd($rawDebit, '0', 4), 4),
+            'currency' => $currency,
         ];
     }
 
@@ -84,6 +149,7 @@ final class EloquentDriver implements LedgerDriverInterface
 
         foreach ($accounts as $account) {
             $query = JournalLine::where('account_code', $account->code)
+                ->where('currency', (string) $account->currency)
                 ->whereHas('entry', function (Builder $q): void {
                     // Posted AND reversed: the mirror entry nets the
                     // reversed original out (see balance()).

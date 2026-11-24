@@ -45,6 +45,16 @@ class BankIntegrationServiceProvider extends ServiceProvider
             }
         );
 
+        // Shared provider registry: sandbox providers are refused when
+        // the app runs in production. The account-opening factory
+        // resolves its provider through this registry.
+        $this->app->singleton(
+            \App\Domain\Banking\Providers\Support\ProviderRegistry::class,
+            fn () => new \App\Domain\Banking\Providers\Support\ProviderRegistry(
+                sandboxAllowed: ! app()->environment('production'),
+            ),
+        );
+
         // Bank-account opening: the provider is resolved from
         // config/banking.php via the factory. The default is the sandbox
         // adapter, which refuses to run in production; a production
@@ -53,7 +63,12 @@ class BankIntegrationServiceProvider extends ServiceProvider
             AccountProviderInterface::class,
             fn ($app) => $app->make(BankAccountProviderFactory::class)->make(),
         );
-        $this->app->singleton(BankAccountProviderFactory::class);
+        $this->app->singleton(
+            BankAccountProviderFactory::class,
+            fn ($app) => new BankAccountProviderFactory(
+                $app->make(\App\Domain\Banking\Providers\Support\ProviderRegistry::class),
+            ),
+        );
         $this->app->singleton(
             BankAccountOpeningService::class,
             fn ($app) => new BankAccountOpeningService(

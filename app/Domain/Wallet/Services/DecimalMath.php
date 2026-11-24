@@ -41,6 +41,26 @@ final class DecimalMath
         return (string) BigDecimal::of($amount)->toScale(18, RoundingMode::DOWN);
     }
 
+    /**
+     * Exact sum of decimal strings (e.g. DB decimal columns read back as
+     * strings). Never sum money through SQL SUM + (string) float cast:
+     * SQLite/MySQL SUM over decimals returns a binary float, so
+     * 0.1 + 0.2 comes back as 0.30000000000000004 and a daily limit of
+     * 0.30 is wrongly exceeded. Values are summed with BigDecimal.
+     *
+     * @param  iterable<string|int|float>  $values
+     * @return numeric-string
+     */
+    public static function exactSum(iterable $values, int $scale = 4): string
+    {
+        $total = BigDecimal::zero();
+        foreach ($values as $value) {
+            $total = $total->plus(BigDecimal::of((string) $value));
+        }
+
+        return (string) $total->toScale($scale, RoundingMode::HALF_UP);
+    }
+
     /** @return numeric-string */
     public static function add(string $a, string $b, int $scale = 4): string
     {

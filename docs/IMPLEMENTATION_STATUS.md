@@ -152,3 +152,111 @@ live-provider end-to-end tests (no sandbox credentials exist).
   statement via provider → status sync → capability-gated closure. Provider
   rejection → `rejected` + exception; unclassifiable outcome → 
 ...[truncated 10976 chars]
+---
+
+> **Note on the text above (Phase 9, 2026-11-24):** the file as committed
+> ends abruptly mid-sentence at the end of §4.3 ("unclassifiable outcome →").
+> The §4.4+ module sections and the §8 blockers table (B1–B8) referenced in
+> §1 are not in the file. They were not reconstructed here; the hardening
+> section below is appended as-is, and the standing blockers are listed in
+> §9.4 at the granularity the session record supports.
+
+## 9. Hardening session — Phases 0–9 (2026-11-24, Phase 9 validation)
+
+Branch `feat/hardening-phase0-9`, HEAD `2d6ca15` (clean tree at session
+start). Commits: `dac9be9` (Phase 0–1: baseline, KYC fail-closed, ledger
+outbox/idempotency/precision, Iranian rails gate, trading settlement —
+58 files) and `2d6ca15` (Phase 2–5: provider kernel + payment intents,
+wallet precision/custody gates, SafeDeal domain, International P2P —
+188 files). **Nothing pushed, nothing committed by Phase 9** — Phase 9
+changes below are uncommitted; sibling agents' parallel work
+(Meetings/i18n, Security) is also uncommitted in the same tree.
+
+### 9.1 Verified numbers (observed in Phase 9, `phpunit.ci.xml`, `--default-time-limit=300`)
+
+| Suite | Passed | Assertions |
+|---|---|---|
+| Ledger | 48 | 157 |
+| Compliance / KYC | 80 | 223 |
+| Banking / Rails | 75 | 263 |
+| Exchange | 32 | 143 |
+| Wallet / Card | 27 | 88 |
+| SafeDeal | 19 | 105 |
+| International | 36 | 194 |
+| **Total, per-group and single-process combined re-run** | **317** | **1,173** |
+
+Static analysis: PHPStan level 8 on SafeDeal + International — **49
+errors, all in SafeDeal, 0 in International** (nullable `$request->user()`,
+bcmath `numeric-string` types, missing generics). PHPCS PSR-12 — 18 errors
+before, **7 left, all in test files** (stub classes without a namespace);
+app code clean after `phpcbf` fixed 11. Detail:
+`docs/TEST_COVERAGE_REPORT.md`, `docs/CRITICAL_FIXES_REPORT.md`.
+
+**Working-tree caveat:** the SafeDeal numbers (19 passed) and the Meeting
+numbers (21 passed, §9.2) are verified against the working tree
+**including uncommitted sibling work** — Security hardening of SafeDeal
+counterparty verification (approved platform KYC required; at HEAD
+`2d6ca15` a self-supplied KYC reference sufficed) and the Meetings/i18n
+rework (`MeetingReservationLock`, `lang/fa/` completion). They are not
+HEAD-only results.
+
+### 9.2 Acceptance criteria (18)
+
+| # | Criterion | Verdict |
+|---|---|---|
+| 1 | Simulated KYC cannot approve | ✅ verified |
+| 2 | Disabled Iranian rails cannot initiate | ✅ verified |
+| 3 | Every completed ledger posting balanced | ✅ verified |
+| 4 | Replayed events do not duplicate journals | ✅ verified |
+| 5 | Failed external ledger sync recoverable | ✅ verified |
+| 6 | Unavailable ledger never mistaken for zero balance | ✅ verified |
+| 7 | Concurrent ops preserve balance invariants | ⚠️ verified at unit level (locks + guarded posting on sqlite/array cache); multi-process race **not** tested — blocked (no MySQL; cache store is `array` in tests) |
+| 8 | Trading settlement cannot double-fill/double-settle | ✅ verified |
+| 9 | Trade precision compatible with asset precision | ✅ verified |
+| 10 | Production config refuses unsupported simulation | ✅ verified |
+| 11 | Account opening never fabricates credentials | ✅ verified |
+| 12 | Unavailable payment providers return explicit failure/unknown | ✅ verified |
+| 13 | SafeDeal independently testable lifecycle | ✅ verified (working tree, incl. sibling Phase-8 hardening — see §9.1) |
+| 14 | Meeting reservations prevent conflicting bookings | ✅ verified (working tree, incl. sibling `MeetingReservationLock` + `MeetingConcurrencyTest`) |
+| 15 | fa/en render correctly | ✅ verified (working tree — `lang/fa/` complete, key counts match `en`; `LocalizationHelperTest` incl. Persian digits + fa validation messages) |
+| 16 | Migrations work on clean DB | ✅ verified on sqlite `:memory:`; MySQL **blocked** (no server) |
+| 17 | Critical tests execute successfully | ✅ verified (317 passed, single process, exit 0) |
+| 18 | Unresolved production deps documented | ✅ verified (this section + `docs/CRITICAL_FIXES_REPORT.md` §17 + `docs/ENGINEERING_BASELINE.md`) |
+
+### 9.3 Phase 9 changes (uncommitted, this session only)
+
+- **Docs created:** `docs/CRITICAL_FIXES_REPORT.md`,
+  `docs/FINANCIAL_LEDGER_DESIGN.md`, `docs/IRANIAN_PAYMENT_RAILS.md`,
+  `docs/TEST_COVERAGE_REPORT.md`; this section in
+  `docs/IMPLEMENTATION_STATUS.md`.
+- **Small fixes:** `phpcbf` PSR-12 auto-fix in 4 files
+  (`InternationalReconciliationService`, `InternationalTransferService`,
+  `QuotationService`, `TradeRiskAssessmentService`); renamed the
+  `reconService()` test helper to `intlReconService()` in
+  `tests/Domain/International/Services/ReconciliationServiceTest.php` —
+  it collided with the same-named helper in
+  `tests/Feature/Banking/BankAccountOpeningReconciliationTest.php` and
+  made the combined suite fatal before any test ran.
+- **Combined-run anomaly:** the first combined run failed 11 SafeDeal
+  tests because the sibling Security agent was editing the SafeDeal test
+  files mid-run; re-runs after the edit completed pass (317/317, plus a
+  318/318 probe run). Detail: `docs/TEST_COVERAGE_REPORT.md` §5.
+
+### 9.4 Open items and blockers
+
+**Remaining debt:** 49 PHPStan errors in SafeDeal; 7 PHPCS errors in test
+files; `AppServiceProvider` hardcodes the Eloquent driver and ignores
+`ledger.driver`; `/tmp` (512 MB tmpfs) was 100% full from stale PHPStan
+caches — PHPStan needed `TMPDIR` on `/home`. Full suite (1,359 files) not
+run; no MySQL/PostgreSQL run; no live TigerBeetle run; no multi-process
+concurrency test; frontend never built (Vite manifest missing,
+pre-existing).
+
+**Blockers B1–B8 (standing — live integrations need external contracts,
+credentials, and approvals):** B1 live bank integration; B2 live card
+issuer; B3 live KYC vendor + Iranian KYC provider; B4 custody; B5 HSM /
+key management; B6 live meeting provider (Jitsi); B7 Iranian rails (CBI /
+partner-bank API docs, licensed bank/PSP partnership + sandbox
+credentials, compliance/sanctions review); B8 live market-data /
+exchange-rate provider. No live provider is contracted; all current rates
+are sandbox-labelled or fixed demo values.

@@ -42,11 +42,17 @@ class UserResource extends Resource
                         ->password()
                         ->required()
                         ->maxLength(255),
-                    Forms\Components\Textarea::make('two_factor_secret')
-                        ->columnSpanFull(),
-                    Forms\Components\Textarea::make('two_factor_recovery_codes')
-                        ->columnSpanFull(),
-                    Forms\Components\DateTimePicker::make('two_factor_confirmed_at'),
+                    // NOTE (Phase 8 security hardening): two_factor_secret and
+                    // two_factor_recovery_codes are deliberately NOT editable
+                    // (or viewable) here. They are encrypted account-recovery
+                    // secrets; exposing them in the admin form would let any
+                    // admin with user-edit access bypass the user's second
+                    // factor. The table still shows two_factor_confirmed_at
+                    // (status only). Rotation/recovery stays with the user's
+                    // own authenticated 2FA flows.
+                    Forms\Components\DateTimePicker::make('two_factor_confirmed_at')
+                        ->disabled()
+                        ->helperText('2FA status only — the secret and recovery codes are never shown in the admin panel.'),
                     Forms\Components\TextInput::make('current_team_id')
                         ->numeric()
                         ->default(null),
@@ -124,11 +130,11 @@ class UserResource extends Resource
                         ->label('KYC status')
                         ->options([
                             'not_started' => 'Not started',
-                            'pending' => 'Pending',
-                            'in_review' => 'In review',
-                            'approved' => 'Approved',
-                            'rejected' => 'Rejected',
-                            'expired' => 'Expired',
+                            'pending'     => 'Pending',
+                            'in_review'   => 'In review',
+                            'approved'    => 'Approved',
+                            'rejected'    => 'Rejected',
+                            'expired'     => 'Expired',
                         ]),
                 ]
             )

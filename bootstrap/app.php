@@ -175,6 +175,7 @@ return Application::configure(basePath: is_string($_appBasePath) ? $_appBasePath
         // Apply middleware to API routes (no global throttling - use custom rate limiting)
         $middleware->group('api', [
             App\Http\Middleware\IpBlocking::class,
+            App\Http\Middleware\SetLocale::class,
             Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
             Illuminate\Routing\Middleware\SubstituteBindings::class,
             App\Http\Middleware\SecurityHeaders::class,
@@ -198,6 +199,8 @@ return Application::configure(basePath: is_string($_appBasePath) ? $_appBasePath
             App\Http\Middleware\VerifyCsrfToken::class,
             Illuminate\Routing\Middleware\SubstituteBindings::class,
             App\Http\Middleware\SecurityHeaders::class,
+            // Resolve fa/en from session, then Accept-Language, then default.
+            App\Http\Middleware\SetLocale::class,
             // Ends a session whose password hash is stale (after a reset or
             // change elsewhere), whatever the session store.
             Laravel\Jetstream\Http\Middleware\AuthenticateSession::class,

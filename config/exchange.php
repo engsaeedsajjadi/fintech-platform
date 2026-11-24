@@ -25,7 +25,20 @@ return [
     'providers' => [
 
         'mock' => [
-            'enabled'   => env('EXCHANGE_MOCK_ENABLED', true),
+            // Phase 8: the mock provider returns RANDOM rates (rand() jitter
+            // around fixed tables). It used to default to enabled in EVERY
+            // environment, and the enhanced rate service stores whatever the
+            // registry returns as a real rate — so a production deploy
+            // served invented prices on money paths. It now defaults to
+            // enabled only in local/testing/demo; production needs an
+            // explicit EXCHANGE_MOCK_ENABLED=true opt-in, which the deploy
+            // preflight refuses and which the service provider also refuses
+            // to register in production (see
+            // ExchangeRateProviderServiceProvider::boot).
+            'enabled' => env(
+                'EXCHANGE_MOCK_ENABLED',
+                in_array(env('APP_ENV', 'production'), ['local', 'testing', 'demo'], true),
+            ),
             'name'      => 'Mock Exchange Rate Provider',
             'priority'  => 1,
             'available' => true,

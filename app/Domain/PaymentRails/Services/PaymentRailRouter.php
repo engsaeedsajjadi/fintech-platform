@@ -6,6 +6,7 @@ namespace App\Domain\PaymentRails\Services;
 
 use App\Domain\Banking\Services\IntelligentRoutingService;
 use App\Domain\PaymentRails\Enums\PaymentRail;
+use App\Domain\PaymentRails\Exceptions\RailUnavailableException;
 use App\Domain\PaymentRails\Models\PaymentRailTransaction;
 use InvalidArgumentException;
 
@@ -30,6 +31,12 @@ final class PaymentRailRouter
     /**
      * Route a payment to the optimal rail and dispatch it.
      *
+     * Rails are tried in score order: when the recommended rail is
+     * unavailable (disabled, no transmission endpoint), the next
+     * alternative is tried. If no rail can carry the payment, this throws
+     * {@see RailUnavailableException} and records nothing — a payment
+     * that cannot be sent is a refusal, never a stub transaction.
+     *
      * @param  array{
      *     name: string,
      *     account_number?: string,
@@ -37,7 +44,7 @@ final class PaymentRailRouter
      *     iban?: string,
      *     bic?: string,
      * } $beneficiary
-     * @return array{transaction_id: string, rail: string, status: string, routing_decision: array<string, mixed>}
+     * @return array{transaction_id: string, rail: string, status: string, transmitted: bool, routing_decision: array<string, mixed>}
      */
     public function route(
         int $userId,
@@ -56,11 +63,34 @@ final class PaymentRailRouter
         $decision = $this->routing->selectOptimalRail($normalizedAmount, $currency, $country, $urgency);
 
         $recommendedRail = $decision['recommended_rail'];
+        $candidates = array_values(array_unique(array_merge(
+            [$recommendedRail],
+            array_map(static fn (array $alt): string => $alt['rail'], $decision['alternatives']),
+        )));
 
-        $result = $this->dispatch($userId, $recommendedRail, $normalizedAmount, $currency, $beneficiary);
+        $lastUnavailable = null;
+        $result = null;
+        $usedRail = null;
+        foreach ($candidates as $candidate) {
+            try {
+                $result = $this->dispatch($userId, $candidate, $normalizedAmount, $currency, $beneficiary);
+                $usedRail = $candidate;
+
+                break;
+            } catch (RailUnavailableException $e) {
+                $lastUnavailable = $e;
+            }
+        }
+
+        if ($result === null || $usedRail === null) {
+            throw new RailUnavailableException(
+                'No payment rail can carry this payment (tried: ' . implode(', ', $candidates) . '). '
+                . ($lastUnavailable !== null ? 'Last refusal: ' . $lastUnavailable->getMessage() : ''),
+            );
+        }
 
         $this->routing->logDecision(
-            rail: $recommendedRail,
+            rail: $usedRail,
             score: $decision['score'],
             factors: $decision['decision_factors'],
             transactionId: $result['transaction_id'],
@@ -68,8 +98,9 @@ final class PaymentRailRouter
 
         return [
             'transaction_id'   => $result['transaction_id'],
-            'rail'             => $recommendedRail,
+            'rail'             => $usedRail,
             'status'           => $result['status'],
+            'transmitted'      => $result['transmitted'] ?? false,
             'routing_decision' => [
                 'recommended_rail' => $decision['recommended_rail'],
                 'score'            => $decision['score'],
@@ -83,6 +114,12 @@ final class PaymentRailRouter
 
     /**
      * Return the available payment rails for a given ISO-3166-1 alpha-2 country code.
+     *
+     * This is the CAPABILITY list: rails the platform knows for the
+     * country. It says nothing about live connectivity — a rail listed
+     * here may still be disabled or have no transmission endpoint (see
+     * {@see getAvailableRails()} for the rails that can actually carry a
+     * payment right now).
      *
      * @return string[]
      */
@@ -114,6 +151,28 @@ final class PaymentRailRouter
         }
 
         return [PaymentRail::SWIFT->value];
+    }
+
+    /**
+     * Rails that can actually carry a payment right now: supported for
+     * the country AND enabled in config. SEPA / SEPA_INSTANT / SWIFT
+     * have no transmission implementation yet, so they are never listed.
+     *
+     * @return string[]
+     */
+    public function getAvailableRails(string $country): array
+    {
+        $enabled = [
+            PaymentRail::ACH->value     => (bool) config('payment_rails.ach.enabled', false),
+            PaymentRail::FEDWIRE->value => (bool) config('payment_rails.fedwire.enabled', false),
+            PaymentRail::RTP->value     => (bool) config('payment_rails.rtp.enabled', false),
+            PaymentRail::FEDNOW->value  => (bool) config('payment_rails.fednow.enabled', false),
+        ];
+
+        return array_values(array_filter(
+            $this->getSupportedRails($country),
+            static fn (string $rail): bool => $enabled[$rail] ?? false,
+        ));
     }
 
     /**
@@ -165,6 +224,11 @@ final class PaymentRailRouter
     /**
      * Dispatch to the concrete rail service that matches $rail.
      *
+     * Rails without a dedicated service or transmission endpoint
+     * (SEPA, SEPA_INSTANT, SWIFT) fail closed here: the old code recorded
+     * a stub "pending" transaction for them, which looked like money in
+     * flight. No stub is ever recorded.
+     *
      * @param  numeric-string $amount
      * @param  array{
      *     name: string,
@@ -173,7 +237,7 @@ final class PaymentRailRouter
      *     iban?: string,
      *     bic?: string,
      * } $beneficiary
-     * @return array{transaction_id: string, status: string}
+     * @return array{transaction_id: string, status: string, transmitted: bool}
      */
     private function dispatch(
         int $userId,
@@ -187,18 +251,24 @@ final class PaymentRailRouter
             PaymentRail::FEDWIRE->value => $this->dispatchFedwire($userId, $amount, $currency, $beneficiary),
             PaymentRail::RTP->value     => $this->dispatchRtp($userId, $amount, $currency, $beneficiary),
             PaymentRail::FEDNOW->value  => $this->dispatchFednow($userId, $amount, $currency, $beneficiary),
-            // SEPA / SEPA_INSTANT / SWIFT are not yet handled by dedicated services;
-            // record a stub transaction so routing still returns a transaction ID.
-            default => $this->dispatchFallback($userId, $rail, $amount, $currency, $beneficiary),
+            default                     => throw new RailUnavailableException(
+                "Payment rail '{$rail}' has no transmission implementation yet — no dedicated service and no live endpoint. The payment was not sent.",
+            ),
         };
     }
 
     /**
      * @param  array{name: string, account_number?: string, routing_number?: string, iban?: string, bic?: string} $beneficiary
-     * @return array{transaction_id: string, status: string}
+     * @return array{transaction_id: string, status: string, transmitted: bool}
      */
     private function dispatchAch(int $userId, string $amount, string $currency, array $beneficiary): array
     {
+        if (! (bool) config('payment_rails.ach.enabled', false)) {
+            throw new RailUnavailableException(
+                'ACH is not enabled (payment_rails.ach.enabled=false). No batch was created.',
+            );
+        }
+
         $accountNumber = $beneficiary['account_number'] ?? '';
         $routingNumber = $beneficiary['routing_number'] ?? '';
 
@@ -219,12 +289,14 @@ final class PaymentRailRouter
         return [
             'transaction_id' => $batch->batch_id,
             'status'         => $batch->status->value,
+            // An ACH batch is a local NACHA file, not a transmitted payment.
+            'transmitted' => false,
         ];
     }
 
     /**
      * @param  array{name: string, account_number?: string, routing_number?: string, iban?: string, bic?: string} $beneficiary
-     * @return array{transaction_id: string, status: string}
+     * @return array{transaction_id: string, status: string, transmitted: bool}
      */
     private function dispatchFedwire(int $userId, string $amount, string $currency, array $beneficiary): array
     {
@@ -247,12 +319,13 @@ final class PaymentRailRouter
         return [
             'transaction_id' => (string) $result['transaction_id'],
             'status'         => $result['status'],
+            'transmitted'    => $result['transmitted'] ?? false,
         ];
     }
 
     /**
      * @param  array{name: string, account_number?: string, routing_number?: string, iban?: string, bic?: string} $beneficiary
-     * @return array{transaction_id: string, status: string}
+     * @return array{transaction_id: string, status: string, transmitted: bool}
      */
     private function dispatchRtp(int $userId, string $amount, string $currency, array $beneficiary): array
     {
@@ -275,29 +348,24 @@ final class PaymentRailRouter
         return [
             'transaction_id' => (string) $result['transaction_id'],
             'status'         => $result['status'],
+            'transmitted'    => $result['transmitted'] ?? false,
         ];
     }
 
     /**
      * @param  array{name: string, account_number?: string, routing_number?: string, iban?: string, bic?: string} $beneficiary
-     * @return array{transaction_id: string, status: string}
+     * @return array{transaction_id: string, status: string, transmitted: bool}
      */
     private function dispatchFednow(int $userId, string $amount, string $currency, array $beneficiary): array
     {
         $iban = $beneficiary['iban'] ?? '';
         $bic = $beneficiary['bic'] ?? '';
 
-        // FedNow uses ISO 20022 — prefer IBAN/BIC; fall back to synthesised values.
-        if ($iban === '') {
-            $accountNumber = $beneficiary['account_number'] ?? '';
-            $routingNumber = $beneficiary['routing_number'] ?? '';
-
-            if ($accountNumber === '' || $routingNumber === '') {
-                throw new InvalidArgumentException('FedNow requires either iban/bic or account_number/routing_number.');
-            }
-
-            $iban = 'US' . $routingNumber . $accountNumber;
-            $bic = $bic !== '' ? $bic : 'FNBKUS33';
+        // FedNow needs a real creditor IBAN/BIC. The old code synthesised
+        // one from routing + account number ('US' . routing . account) —
+        // a fabricated identifier that could never clear. Refuse instead.
+        if ($iban === '' || $bic === '') {
+            throw new InvalidArgumentException('FedNow requires iban and bic.');
         }
 
         $result = $this->fednow->sendInstantPayment(
@@ -312,39 +380,7 @@ final class PaymentRailRouter
         return [
             'transaction_id' => (string) $result['transaction_id'],
             'status'         => $result['status'],
-        ];
-    }
-
-    /**
-     * Stub dispatcher for rails without dedicated services (SEPA, SWIFT, …).
-     *
-     * @param  array{name: string, account_number?: string, routing_number?: string, iban?: string, bic?: string} $beneficiary
-     * @return array{transaction_id: string, status: string}
-     */
-    private function dispatchFallback(
-        int $userId,
-        string $rail,
-        string $amount,
-        string $currency,
-        array $beneficiary,
-    ): array {
-        $transaction = PaymentRailTransaction::create([
-            'user_id'   => $userId,
-            'rail'      => $rail,
-            'amount'    => $amount,
-            'currency'  => $currency,
-            'status'    => 'pending',
-            'direction' => 'debit',
-            'metadata'  => [
-                'beneficiary_name' => $beneficiary['name'],
-                'iban'             => $beneficiary['iban'] ?? null,
-                'bic'              => $beneficiary['bic'] ?? null,
-            ],
-        ]);
-
-        return [
-            'transaction_id' => $transaction->id,
-            'status'         => $transaction->status->value,
+            'transmitted'    => $result['transmitted'] ?? false,
         ];
     }
 }

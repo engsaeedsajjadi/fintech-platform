@@ -54,6 +54,19 @@ return [
             // PATCHes the customer to 0. See ADR-0006.
             'default_developer_fee_bps' => (int) env('BRIDGE_DEFAULT_DEV_FEE_BPS', 75),
         ],
+
+        'iranian' => [
+            // Iranian KYC (national identity, mobile ownership, bank
+            // ownership, documents). There is NO real provider
+            // contracted: no civil-registry, Shahkar, or bank API
+            // access exists in-repo. 'sandbox' is the only value that
+            // resolves today (SandboxIranianKycProvider: format-only
+            // national-code checksum + requires_manual_review for every
+            // real check). A future real adapter registers here under
+            // its own name with its own credentials — never by
+            // pretending the sandbox is a registry lookup.
+            'provider' => env('KYC_IRANIAN_PROVIDER', 'sandbox'),
+        ],
     ],
 
     /*

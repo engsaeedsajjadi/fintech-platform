@@ -8,14 +8,28 @@ use Brick\Math\BigDecimal;
 use Exception;
 use InvalidArgumentException;
 use Workflow\Activity;
+use Workflow\Models\StoredWorkflow;
 
 class UpdateOrderBookActivity extends Activity
 {
-    public function __construct()
-    {
-        // No-arg constructor so the activity can also run synchronously
-        // outside the durable-workflow runtime (same pattern as
-        // MatchOrderActivity). The workflow runtime never calls this.
+    /**
+     * Dual-mode constructor: with no arguments the activity runs
+     * synchronously outside the durable-workflow runtime (as the sync
+     * order-book service does); with the runtime's (index, now,
+     * storedWorkflow, ...args) the parent constructor runs so the
+     * activity can be dispatched as a queued job. A plain no-arg
+     * constructor broke runtime dispatch — Dispatchable::dispatch()
+     * constructs with the runtime arguments.
+     */
+    public function __construct(
+        int $index = 0,
+        string $now = '',
+        ?StoredWorkflow $storedWorkflow = null,
+        mixed ...$arguments,
+    ) {
+        if ($storedWorkflow !== null) {
+            parent::__construct($index, $now, $storedWorkflow, ...$arguments);
+        }
     }
 
     public function execute(

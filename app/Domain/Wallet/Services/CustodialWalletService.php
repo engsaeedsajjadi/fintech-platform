@@ -37,13 +37,18 @@ final class CustodialWalletService
             throw new CustodyUnavailableException('No custodian is configured (WALLET_CUSTODY_PROVIDER). Custodial settlement is unavailable until a licensed custodian is contracted and configured.');
         }
 
+        // Checked BEFORE the registry lookup on purpose: in production
+        // the mock connector is never even registered, so checking after
+        // the lookup would surface a registry error instead of this
+        // explicit custody refusal. Either way production custody with a
+        // demo/mock connector is refused.
+        if (! app()->environment(['local', 'testing', 'demo']) && in_array(strtolower($name), ['demo', 'mock'], true)) {
+            throw new CustodyUnavailableException("Custodian '{$name}' is a demo/mock connector and cannot settle in this environment.");
+        }
+
         $connector = $this->registry->get($name);
         if (! $connector instanceof ICustodianConnector) {
             throw new CustodyUnavailableException("Custodian '{$name}' does not implement the custody seam.");
-        }
-
-        if (! app()->environment(['local', 'testing', 'demo']) && in_array(strtolower($name), ['demo', 'mock'], true)) {
-            throw new CustodyUnavailableException("Custodian '{$name}' is a demo/mock connector and cannot settle in this environment.");
         }
 
         return $connector;

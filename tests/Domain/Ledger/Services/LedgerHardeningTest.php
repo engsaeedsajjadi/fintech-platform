@@ -24,13 +24,22 @@ function hardeningLines(string $debit, string $credit): array
     ];
 }
 
-it('returns the original entry when the same idempotency key is replayed', function (): void {
+it('returns the original entry when the same idempotency key is replayed with the same payload', function (): void {
     $first = $this->ledger->postIdempotent('key-1', 'First', hardeningLines('10.0000', '10.0000'), 'Payment', 'evt-1');
-    $second = $this->ledger->postIdempotent('key-1', 'Replay with different description', hardeningLines('99.0000', '99.0000'), 'Payment', 'evt-2');
+    $second = $this->ledger->postIdempotent('key-1', 'First', hardeningLines('10.0000', '10.0000'), 'Payment', 'evt-1');
 
     expect($second->id)->toBe($first->id)
         ->and($second->entry_number)->toBe($first->entry_number)
         ->and(JournalEntry::count())->toBe(1);
+});
+
+it('refuses a replay with a different payload under the same idempotency key', function (): void {
+    $this->ledger->postIdempotent('key-1-conflict', 'First', hardeningLines('10.0000', '10.0000'), 'Payment', 'evt-1');
+
+    expect(fn () => $this->ledger->postIdempotent('key-1-conflict', 'Replay with different description', hardeningLines('99.0000', '99.0000'), 'Payment', 'evt-2'))
+        ->toThrow(RuntimeException::class, 'different payload');
+
+    expect(JournalEntry::count())->toBe(1);
 });
 
 it('rejects unbalanced, zero and negative entries', function (): void {

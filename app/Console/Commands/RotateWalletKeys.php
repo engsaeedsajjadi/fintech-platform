@@ -28,15 +28,24 @@ class RotateWalletKeys extends Command
      */
     protected $description = 'Rotate encryption keys for blockchain wallets';
 
-    protected SecureKeyStorageService $keyStorage;
-
     /**
-     * Create a new command instance.
+     * NOTE (Phase 8 security hardening): this command deliberately does NOT
+     * inject SecureKeyStorageService in the constructor. Artisan discovers
+     * and instantiates EVERY console command when ANY artisan command runs
+     * (including `php artisan key:generate --show` on a fresh install with
+     * no APP_KEY yet), and resolving the key storage at construction time
+     * pulls in the encrypter, which throws MissingAppKeyException before
+     * key:generate can run — a chicken-and-egg boot failure. The service
+     * is resolved lazily inside handle(), only when this command runs.
      */
-    public function __construct(SecureKeyStorageService $keyStorage)
+    public function __construct()
     {
         parent::__construct();
-        $this->keyStorage = $keyStorage;
+    }
+
+    private function keyStorage(): SecureKeyStorageService
+    {
+        return app(SecureKeyStorageService::class);
     }
 
     /**
@@ -87,9 +96,11 @@ class RotateWalletKeys extends Command
         $successful = 0;
         $failed = 0;
 
+        $keyStorage = $this->keyStorage();
+
         foreach ($walletIds as $walletId) {
             try {
-                $this->keyStorage->rotateKeys($walletId, 'system', $reason);
+                $keyStorage->rotateKeys($walletId, 'system', $reason);
                 $successful++;
 
                 $this->line(PHP_EOL . "✓ Rotated keys for wallet: {$walletId}");
@@ -119,7 +130,7 @@ class RotateWalletKeys extends Command
         }
 
         // Purge any expired temporary keys
-        $purged = $this->keyStorage->purgeExpiredKeys();
+        $purged = $keyStorage->purgeExpiredKeys();
         if ($purged > 0) {
             $this->info("  Purged {$purged} expired temporary keys");
         }

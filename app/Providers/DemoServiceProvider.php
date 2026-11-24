@@ -33,8 +33,13 @@ class DemoServiceProvider extends ServiceProvider
             // Demo environment: Use DemoPaymentService that bypasses external APIs
             $this->app->bind(PaymentServiceInterface::class, DemoPaymentService::class);
             $this->app->bind(PayseraDepositServiceInterface::class, DemoPayseraDepositService::class);
-        } elseif (config('demo.sandbox.enabled')) {
-            // Sandbox mode: Use SandboxPaymentService with real sandbox APIs
+        } elseif (config('demo.sandbox.enabled') && ! $this->app->environment('production')) {
+            // Sandbox mode: Use SandboxPaymentService with real sandbox APIs.
+            // Phase 8: the production guard is load-bearing — SANDBOX_MODE
+            // used to rebind the production payment service to the sandbox
+            // implementation with no environment check at all (the preflight
+            // FAIL was the only guard). Production now always falls through
+            // to ProductionPaymentService, whatever SANDBOX_MODE says.
             $this->app->bind(PaymentServiceInterface::class, SandboxPaymentService::class);
             $this->app->bind(PayseraDepositServiceInterface::class, PayseraDepositService::class);
         } else {

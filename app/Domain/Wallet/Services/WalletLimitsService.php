@@ -30,11 +30,11 @@ final class WalletLimitsService
             $amount,
             (string) ($limits['deposit_per_day'] ?? '0'),
             'fiat deposit',
-            FiatDeposit::query()
+            DecimalMath::exactSum(FiatDeposit::query()
                 ->where('account_uuid', $accountUuid)->where('currency', $currency)
                 ->where('status', FiatDeposit::STATUS_COMPLETED)
                 ->whereDate('created_at', Carbon::today())
-                ->sum('amount')
+                ->pluck('amount')->all())
         );
     }
 
@@ -46,11 +46,11 @@ final class WalletLimitsService
             $amount,
             (string) ($limits['withdrawal_per_day'] ?? '0'),
             'fiat withdrawal',
-            FiatWithdrawal::query()
+            DecimalMath::exactSum(FiatWithdrawal::query()
                 ->where('account_uuid', $accountUuid)->where('currency', $currency)
                 ->whereIn('status', [FiatWithdrawal::STATUS_PENDING_APPROVAL, FiatWithdrawal::STATUS_APPROVED, FiatWithdrawal::STATUS_COMPLETED])
                 ->whereDate('created_at', Carbon::today())
-                ->sum('amount')
+                ->pluck('amount')->all())
         );
     }
 
@@ -62,11 +62,11 @@ final class WalletLimitsService
             $amount,
             (string) ($limits['transfer_per_day'] ?? '0'),
             'fiat transfer',
-            FiatTransfer::query()
+            DecimalMath::exactSum(FiatTransfer::query()
                 ->where('from_account_uuid', $accountUuid)->where('currency', $currency)
                 ->where('status', FiatTransfer::STATUS_COMPLETED)
                 ->whereDate('created_at', Carbon::today())
-                ->sum('amount')
+                ->pluck('amount')->all())
         );
     }
 
@@ -78,11 +78,11 @@ final class WalletLimitsService
             $amount,
             (string) ($limits['conversion_per_day'] ?? '0'),
             'fiat conversion',
-            Conversion::query()
+            DecimalMath::exactSum(Conversion::query()
                 ->where('account_uuid', $accountUuid)
                 ->where('status', Conversion::STATUS_COMPLETED)
                 ->whereDate('created_at', Carbon::today())
-                ->sum('from_amount')
+                ->pluck('from_amount')->all())
         );
     }
 

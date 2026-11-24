@@ -15,8 +15,14 @@ final class RtpService
     /**
      * Send a Real-Time Payment via The Clearing House RTP network.
      *
+     * There is no live RTP transmission endpoint: the instruction is
+     * recorded ONLY in simulation mode (see {@see RailTransmissionGate})
+     * with status INITIATED and `transmitted: false`. Outside simulation
+     * mode this throws {@see RailUnavailableException} and creates no row.
+     *
      * @throws InvalidArgumentException when amount exceeds the configured maximum
-     * @return array{transaction_id: string, external_id: string, status: string, rail: string, amount: string, currency: string}
+     * @throws \App\Domain\PaymentRails\Exceptions\RailUnavailableException when the rail cannot transmit
+     * @return array{transaction_id: string, external_id: string, status: string, rail: string, amount: string, currency: string, transmitted: bool, simulation: bool}
      */
     public function sendPayment(
         int $userId,
@@ -27,9 +33,13 @@ final class RtpService
         string $creditorRoutingNumber,
         ?string $reference = null,
     ): array {
+        RailTransmissionGate::ensureSimulationAllowed('RTP', 'rtp');
+
         $maxAmount = (int) config('payment_rails.rtp.max_amount', 100000000);
 
-        if ((int) round((float) $amount * 100) > $maxAmount) {
+        // Exact decimal comparison: (float) $amount * 100 loses cents at
+        // the boundary (e.g. 1000000.01 becomes 100000000.999...).
+        if (! is_numeric($amount) || bccomp(bcmul($amount, '100', 2), (string) $maxAmount, 2) === 1) {
             throw new InvalidArgumentException(
                 "RTP amount {$amount} exceeds maximum allowed {$maxAmount} cents."
             );
@@ -43,32 +53,41 @@ final class RtpService
             'external_id' => $externalId,
             'amount'      => $amount,
             'currency'    => $currency,
-            'status'      => RailStatus::PROCESSING,
-            'direction'   => 'debit',
-            'metadata'    => [
+            // INITIATED, not PROCESSING: nothing was transmitted.
+            'status'    => RailStatus::INITIATED,
+            'direction' => 'debit',
+            'metadata'  => [
                 'creditor_name'           => $creditorName,
                 'creditor_account_number' => $creditorAccountNumber,
                 'creditor_routing_number' => $creditorRoutingNumber,
                 'reference'               => $reference,
                 'participant_id'          => config('payment_rails.rtp.participant_id'),
                 'type'                    => 'send',
+                'transmitted'             => false,
+                'simulation'              => true,
             ],
         ]);
 
         return [
             'transaction_id' => $transaction->id,
             'external_id'    => $externalId,
-            'status'         => RailStatus::PROCESSING->value,
+            'status'         => RailStatus::INITIATED->value,
             'rail'           => PaymentRail::RTP->value,
             'amount'         => $amount,
             'currency'       => $currency,
+            'transmitted'    => false,
+            'simulation'     => true,
         ];
     }
 
     /**
      * Issue a Request for Payment (RfP) via the RTP network.
      *
-     * @return array{transaction_id: string, external_id: string, status: string, rail: string, amount: string, currency: string}
+     * Same gate as sendPayment: no live endpoint exists, so the request
+     * is recorded ONLY in simulation mode, as INITIATED and untransmitted.
+     *
+     * @throws \App\Domain\PaymentRails\Exceptions\RailUnavailableException when the rail cannot transmit
+     * @return array{transaction_id: string, external_id: string, status: string, rail: string, amount: string, currency: string, transmitted: bool, simulation: bool}
      */
     public function requestPayment(
         int $userId,
@@ -78,6 +97,8 @@ final class RtpService
         string $debtorRoutingNumber,
         ?string $reference = null,
     ): array {
+        RailTransmissionGate::ensureSimulationAllowed('RTP', 'rtp');
+
         $externalId = 'RTP-RFP-' . strtoupper(Str::random(12));
 
         $transaction = PaymentRailTransaction::create([
@@ -86,7 +107,7 @@ final class RtpService
             'external_id' => $externalId,
             'amount'      => $amount,
             'currency'    => $currency,
-            'status'      => RailStatus::PENDING,
+            'status'      => RailStatus::INITIATED,
             'direction'   => 'credit',
             'metadata'    => [
                 'debtor_name'           => $debtorName,
@@ -94,16 +115,20 @@ final class RtpService
                 'reference'             => $reference,
                 'participant_id'        => config('payment_rails.rtp.participant_id'),
                 'type'                  => 'request',
+                'transmitted'           => false,
+                'simulation'            => true,
             ],
         ]);
 
         return [
             'transaction_id' => $transaction->id,
             'external_id'    => $externalId,
-            'status'         => RailStatus::PENDING->value,
+            'status'         => RailStatus::INITIATED->value,
             'rail'           => PaymentRail::RTP->value,
             'amount'         => $amount,
             'currency'       => $currency,
+            'transmitted'    => false,
+            'simulation'     => true,
         ];
     }
 

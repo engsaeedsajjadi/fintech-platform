@@ -409,6 +409,22 @@
 
                             <div class="border-t border-gray-200 dark:border-gray-600"></div>
 
+                            <!-- Language -->
+                            <div class="block px-4 py-2 text-xs text-gray-400">
+                                {{ __('dashboard.language') }}
+                            </div>
+
+                            @foreach (['fa' => __('dashboard.language_fa'), 'en' => __('dashboard.language_en')] as $code => $label)
+                                <form method="POST" action="{{ route('locale.switch', $code) }}">
+                                    @csrf
+                                    <button type="submit" class="w-full text-start block px-4 py-2 text-sm leading-5 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 focus:outline-none focus:bg-gray-100 dark:focus:bg-gray-800 transition duration-150 ease-in-out @if(app()->getLocale() === $code) font-semibold text-indigo-600 dark:text-indigo-400 @endif">
+                                        {{ $label }}@if(app()->getLocale() === $code) ✓@endif
+                                    </button>
+                                </form>
+                            @endforeach
+
+                            <div class="border-t border-gray-200 dark:border-gray-600"></div>
+
                             <!-- Authentication -->
                             <form method="POST" action="{{ route('logout') }}" x-data>
                                 @csrf

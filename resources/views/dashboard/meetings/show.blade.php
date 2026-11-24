@@ -5,7 +5,7 @@
         </h2>
     </x-slot>
 
-    <div @if(app()->getLocale() === 'fa') dir="rtl" lang="fa" @endif class="py-12">
+    <div class="py-12">
         <div class="max-w-7xl mx-auto sm:px-6 lg:px-8 space-y-6">
             <div class="bg-white dark:bg-gray-800 overflow-hidden shadow-sm sm:rounded-lg">
                 <div class="p-6 space-y-2">
@@ -16,12 +16,10 @@
                         {{ __('meeting.provider') }}: {{ $meeting->provider }}
                     </p>
                     <p class="text-sm text-gray-600 dark:text-gray-300">
-                        {{ __('meeting.starts_at') }}: {{ \App\Domain\Meeting\Support\JalaliDateHelper::format($meeting->starts_at) }}
-                        ({{ $meeting->starts_at->format('Y-m-d H:i') }})
+                        {{ __('meeting.starts_at') }}: {{ \App\Domain\Meeting\Support\LocalizedDateHelper::format($meeting->starts_at) }}
                     </p>
                     <p class="text-sm text-gray-600 dark:text-gray-300">
-                        {{ __('meeting.ends_at') }}: {{ \App\Domain\Meeting\Support\JalaliDateHelper::format($meeting->ends_at) }}
-                        ({{ $meeting->ends_at->format('Y-m-d H:i') }})
+                        {{ __('meeting.ends_at') }}: {{ \App\Domain\Meeting\Support\LocalizedDateHelper::format($meeting->ends_at) }}
                     </p>
                     @if($meeting->description)
                         <p class="text-gray-700 dark:text-gray-200">{{ $meeting->description }}</p>
@@ -33,6 +31,29 @@
                         {{ __('meeting.participants') }}:
                         {{ $meeting->participants->map(fn ($p) => $p->user->name ?? $p->user_uuid)->join(', ') ?: '—' }}
                     </p>
+
+                    @if($meeting->status->isActive())
+                        @php($myInvitation = $meeting->participants->firstWhere('user_uuid', auth()->user()->uuid))
+                        @if($myInvitation)
+                            <p class="text-sm text-gray-600 dark:text-gray-300">
+                                {{ __('meeting.invitation_status') }}: {{ $myInvitation->status->value }}
+                            </p>
+                            @if($myInvitation->status->value === 'invited')
+                                <div class="flex gap-2 pt-2">
+                                    <form method="POST" action="{{ route('dashboard.meetings.respond', $meeting) }}">
+                                        @csrf
+                                        <input type="hidden" name="status" value="accepted">
+                                        <button type="submit" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">{{ __('meeting.accept') }}</button>
+                                    </form>
+                                    <form method="POST" action="{{ route('dashboard.meetings.respond', $meeting) }}">
+                                        @csrf
+                                        <input type="hidden" name="status" value="declined">
+                                        <button type="submit" class="px-4 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50 dark:bg-gray-700 dark:text-gray-100">{{ __('meeting.decline') }}</button>
+                                    </form>
+                                </div>
+                            @endif
+                        @endif
+                    @endif
 
                     @if($meeting->status->isActive())
                         <form method="POST" action="{{ route('dashboard.meetings.join', $meeting) }}" class="pt-2">
