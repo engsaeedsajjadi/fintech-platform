@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Tests\Domain\SafeDeal;
 
+use App\Domain\Ledger\Models\LedgerAccount;
+use App\Domain\Ledger\Services\LedgerService;
+use App\Models\User;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
@@ -18,6 +21,7 @@ class SafeDealApiTest extends TestCase
         // KYC (enhanced level for the 'enhanced' verifications below).
         $buyer->update(['kyc_status' => 'approved', 'kyc_level' => 'enhanced']);
         $seller->update(['kyc_status' => 'approved', 'kyc_level' => 'enhanced']);
+        $this->seedBuyerLedgerBalance($buyer);
 
         Sanctum::actingAs($buyer, ['read', 'write', 'delete']);
 
@@ -73,6 +77,32 @@ class SafeDealApiTest extends TestCase
         $stranger = \App\Models\User::factory()->create();
         Sanctum::actingAs($stranger, ['read', 'write', 'delete']);
         $this->getJson("/api/v1/safedeal/trades/{$tradeId}")->assertForbidden();
+    }
+
+    private function seedBuyerLedgerBalance(User $buyer): void
+    {
+        $buyerCode = "SAFEDEAL:BUYER:{$buyer->id}:USD";
+        $fundingCode = 'SAFEDEAL:TEST-FUNDING:USD';
+
+        LedgerAccount::firstOrCreate(
+            ['code' => $buyerCode],
+            ['name' => 'SafeDeal test buyer balance', 'type' => 'liability', 'currency' => 'USD', 'is_active' => true],
+        );
+        LedgerAccount::firstOrCreate(
+            ['code' => $fundingCode],
+            ['name' => 'SafeDeal test funding source', 'type' => 'asset', 'currency' => 'USD', 'is_active' => true],
+        );
+
+        app(LedgerService::class)->post(
+            'SafeDeal API test opening balance',
+            [
+                ['account_code' => $fundingCode, 'debit' => '1000.0000', 'credit' => '0.0000', 'currency' => 'USD'],
+                ['account_code' => $buyerCode, 'debit' => '0.0000', 'credit' => '1000.0000', 'currency' => 'USD'],
+            ],
+            'SafeDealTest',
+            "api-buyer-fixture:{$buyer->id}",
+            "safedeal-api-test-funding:{$buyer->id}",
+        );
     }
 
     public function test_create_trade_validation_rejects_bad_milestones(): void
