@@ -7,6 +7,7 @@
 /public/storage
 /storage/*.key
 /storage/firebase-credentials.json
+/storage/framework/meeting-locks/
 /vendor
 .env
 .env.backup
