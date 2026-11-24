@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Domain\Ledger\Services;
 
 use App\Domain\Ledger\Contracts\LedgerDriverInterface;
+use App\Domain\Ledger\Services\Drivers\EloquentDriver;
 use App\Domain\Ledger\Enums\EntryStatus;
 use App\Domain\Ledger\Exceptions\OptimisticConcurrencyException;
 use App\Domain\Ledger\Models\IdempotencyKey;
@@ -160,6 +161,14 @@ final class LedgerService
                 ]);
             }
 
+            // Persist the external-driver outbox in the same transaction as the journal.
+            if (! ($this->driver instanceof EloquentDriver)) {
+                LedgerDriverSync::firstOrCreate(
+                    ['journal_entry_id' => $entry->id],
+                    ['driver' => class_basename($this->driver), 'status' => 'pending', 'attempts' => 0],
+                );
+            }
+
             $entry->load('lines');
 
             return $entry;
@@ -277,63 +286,79 @@ final class LedgerService
         array $guardAccountCodes,
         ?string $sourceDomain = null,
         ?string $sourceEventId = null,
+        ?string $idempotencyKey = null,
     ): JournalEntry {
         $scale = $this->scale();
         $normalised = $this->normaliseLines($lines, $scale);
+        $claim = null;
 
-        // The lock, the posting, the balance re-check and the version bump
-        // all happen in ONE transaction, so no concurrent writer can slip
-        // a debit in between the check and the commit. The driver sync
-        // runs after the transaction commits.
-        $posted = null;
-        DB::transaction(function () use ($description, $normalised, $guardAccountCodes, $sourceDomain, $sourceEventId, $scale, &$posted): void {
-            // Lock the guarded account rows first: concurrent balance
-            // mutations on the same account serialise here.
-            $versions = [];
-            $currencies = [];
-            foreach ($guardAccountCodes as $code) {
-                $account = LedgerAccount::where('code', $code)->lockForUpdate()->first();
-
-                if ($account === null) {
-                    throw new RuntimeException("Guarded ledger account '{$code}' does not exist.");
-                }
-
-                $versions[$code] = (int) $account->version;
-                $currencies[$code] = (string) $account->currency;
+        if ($idempotencyKey !== null) {
+            if (trim($idempotencyKey) === '') {
+                throw new RuntimeException('Idempotency key must not be empty.');
             }
-
-            $posted = $this->persistEntry($description, $normalised, $sourceDomain, $sourceEventId);
-
-            // Re-check balances after posting, still inside the transaction
-            // and still holding the locks — from the DB journal, never from
-            // the (possibly external) driver.
-            foreach ($guardAccountCodes as $code) {
-                $balance = $this->dbBalance($code, $currencies[$code], $scale);
-
-                if (DecimalMath::cmp($balance, '0', $scale) < 0) {
-                    throw new RuntimeException(
-                        "Posting would overdraw ledger account '{$code}': resulting balance {$balance}."
-                    );
-                }
-
-                $updated = LedgerAccount::where('code', $code)
-                    ->where('version', $versions[$code])
-                    ->update(['version' => $versions[$code] + 1]);
-
-                if ($updated !== 1) {
-                    throw new OptimisticConcurrencyException(
-                        "Ledger account '{$code}' was modified concurrently (expected version {$versions[$code]})."
-                    );
+            $requestHash = $this->requestHash($normalised, $sourceDomain, $sourceEventId);
+            $existing = IdempotencyKey::where('key', $idempotencyKey)->first();
+            if ($existing !== null && $existing->journal_entry_id !== null) {
+                $this->assertSameRequest($existing, $requestHash, $idempotencyKey);
+                return JournalEntry::with('lines')->findOrFail($existing->journal_entry_id);
+            }
+            if ($existing !== null && $existing->journal_entry_id === null) {
+                if ($this->isStaleClaim($existing)) {
+                    $existing->delete();
+                } else {
+                    return $this->waitForWinner($idempotencyKey, $requestHash);
                 }
             }
-        });
+            try {
+                $claim = IdempotencyKey::create([
+                    'key' => $idempotencyKey, 'domain' => $sourceDomain ?? 'ledger',
+                    'journal_entry_id' => null, 'request_hash' => $requestHash, 'result' => null,
+                ]);
+            } catch (QueryException $e) {
+                if (! $this->isUniqueViolation($e)) {
+                    throw $e;
+                }
+                return $this->waitForWinner($idempotencyKey, $requestHash, $e);
+            }
+        }
 
-        /** @var JournalEntry $posted */
+        try {
+            $posted = null;
+            DB::transaction(function () use ($description, $normalised, $guardAccountCodes, $sourceDomain, $sourceEventId, $idempotencyKey, $claim, $scale, &$posted): void {
+                $versions = [];
+                $currencies = [];
+                foreach (array_values(array_unique($guardAccountCodes)) as $code) {
+                    $account = LedgerAccount::where('code', $code)->lockForUpdate()->first();
+                    if ($account === null) {
+                        throw new RuntimeException("Guarded ledger account '{$code}' does not exist.");
+                    }
+                    $versions[$code] = (int) $account->version;
+                    $currencies[$code] = (string) $account->currency;
+                }
+
+                $posted = $this->persistEntry($description, $normalised, $sourceDomain, $sourceEventId, $idempotencyKey, $claim);
+                foreach (array_values(array_unique($guardAccountCodes)) as $code) {
+                    $balance = $this->dbBalance($code, $currencies[$code], $scale);
+                    if (DecimalMath::cmp($balance, '0', $scale) < 0) {
+                        throw new RuntimeException("Posting would overdraw ledger account '{$code}': resulting balance {$balance}.");
+                    }
+                    $updated = LedgerAccount::where('code', $code)->where('version', $versions[$code])
+                        ->update(['version' => $versions[$code] + 1]);
+                    if ($updated !== 1) {
+                        throw new OptimisticConcurrencyException("Ledger account '{$code}' was modified concurrently.");
+                    }
+                }
+            });
+        } catch (Throwable $e) {
+            if ($claim !== null) {
+                $claim->delete();
+            }
+            throw $e;
+        }
+
         $this->syncDriver($posted);
-
         return $posted;
     }
-
     /**
      * Reverse a posted journal entry by creating a mirror entry.
      *
@@ -437,31 +462,33 @@ final class LedgerService
      */
     private function syncDriver(JournalEntry $entry): void
     {
-        try {
-            $this->driver->post($entry);
-        } catch (Throwable $e) {
-            Log::error('Ledger driver sync failed — recorded in outbox, DB journal is authoritative', [
-                'entry_id' => $entry->id,
-                'driver'   => $this->driver::class,
-                'error'    => $e->getMessage(),
-            ]);
-
-            $row = LedgerDriverSync::firstOrNew(['journal_entry_id' => $entry->id]);
-            $row->driver = class_basename($this->driver);
-            $row->status = 'pending';
-            $row->attempts = (int) ($row->attempts ?? 0) + 1;
-            $row->last_error = mb_substr($e->getMessage(), 0, 2000);
-            $row->synced_at = null;
-            $row->save();
-
+        if ($this->driver instanceof EloquentDriver) {
             return;
         }
-
-        LedgerDriverSync::where('journal_entry_id', $entry->id)
-            ->where('status', 'pending')
-            ->update(['status' => 'synced', 'synced_at' => Carbon::now(), 'last_error' => null]);
+        $sync = function () use ($entry): void {
+            $row = LedgerDriverSync::where('journal_entry_id', $entry->id)->first();
+            if ($row === null || $row->status === 'synced') {
+                return;
+            }
+            try {
+                $this->driver->post($entry);
+                $row->update(['status' => 'synced', 'synced_at' => Carbon::now(), 'last_error' => null]);
+            } catch (Throwable $e) {
+                Log::error('Ledger driver sync failed — retained in transactional outbox', [
+                    'entry_id' => $entry->id, 'driver' => $this->driver::class, 'error' => $e->getMessage(),
+                ]);
+                $row->update([
+                    'status' => 'pending', 'attempts' => (int) $row->attempts + 1,
+                    'last_error' => mb_substr($e->getMessage(), 0, 2000), 'synced_at' => null,
+                ]);
+            }
+        };
+        if (DB::transactionLevel() > 0) {
+            DB::afterCommit($sync);
+            return;
+        }
+        $sync();
     }
-
     /**
      * Balance of one account in one currency, straight from the DB journal
      * (posted + reversed entries; the mirror nets the original out, so
