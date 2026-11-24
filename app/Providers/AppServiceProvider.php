@@ -28,10 +28,18 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind('one_user_one_vote', \App\Domain\Governance\Strategies\OneUserOneVoteStrategy::class);
         $this->app->bind(\App\Domain\Governance\Strategies\AssetWeightedVotingStrategy::class, \App\Domain\Governance\Strategies\AssetWeightedVotingStrategy::class);
 
-        // Register ledger driver (default: Eloquent)
-        $this->app->bind(
+        // Resolve every Ledger consumer from the same configured driver.
+        $this->app->singleton(
             \App\Domain\Ledger\Contracts\LedgerDriverInterface::class,
-            \App\Domain\Ledger\Services\Drivers\EloquentDriver::class,
+            function ($app): \App\Domain\Ledger\Contracts\LedgerDriverInterface {
+                return match (strtolower((string) config('ledger.driver', 'eloquent'))) {
+                    'eloquent' => $app->make(\App\Domain\Ledger\Services\Drivers\EloquentDriver::class),
+                    'tigerbeetle', 'tiger_beetle' => $app->make(\App\Domain\Ledger\Services\Drivers\TigerBeetleDriver::class),
+                    default => throw new \RuntimeException(
+                        "Unknown ledger driver '" . (string) config('ledger.driver') . "' — expected 'eloquent' or 'tigerbeetle'."
+                    ),
+                };
+            },
         );
 
         // Register blockchain service provider
