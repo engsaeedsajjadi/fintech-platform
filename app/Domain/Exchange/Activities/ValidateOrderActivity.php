@@ -1,0 +1,108 @@
+<?php
+
+namespace App\Domain\Exchange\Activities;
+
+use App\Domain\Account\Models\Account;
+use App\Domain\Asset\Models\Asset;
+use App\Domain\Exchange\Aggregates\Order;
+use App\Domain\Exchange\Projections\Order as OrderProjection;
+use Brick\Math\BigDecimal;
+use Workflow\Activity;
+
+class ValidateOrderActivity extends Activity
+{
+    public function execute(string $orderId): object
+    {
+        /** @var mixed|null $quoteCurrency */
+        $quoteCurrency = null;
+        /** @var mixed|null $baseCurrency */
+        $baseCurrency = null;
+        /** @var mixed|null $orderProjection */
+        $orderProjection = null;
+        /** @var Account|null $account */
+        $account = null;
+        $orderProjection = OrderProjection::where('order_id', $orderId)->first();
+
+        if (! $orderProjection) {
+            return (object) [
+                'isValid' => false,
+                'message' => 'Order not found',
+            ];
+        }
+
+        // Check if order is already filled or cancelled
+        if (! $orderProjection->isOpen()) {
+            return (object) [
+                'isValid' => false,
+                'message' => "Order is {$orderProjection->status}",
+            ];
+        }
+
+        // Validate account exists
+        /** @var Account|null $account */
+        $account = Account::find($orderProjection->account_id);
+        if (! $account) {
+            return (object) [
+                'isValid' => false,
+                'message' => 'Account not found',
+            ];
+        }
+
+        // Validate currencies exist
+        $baseCurrency = Asset::where('code', $orderProjection->base_currency)->first();
+        $quoteCurrency = Asset::where('code', $orderProjection->quote_currency)->first();
+
+        if (! $baseCurrency || ! $quoteCurrency) {
+            return (object) [
+                'isValid' => false,
+                'message' => 'Invalid currency pair',
+            ];
+        }
+
+        // Check if currencies are enabled for trading
+        if (! $baseCurrency->is_tradeable || ! $quoteCurrency->is_tradeable) {
+            return (object) [
+                'isValid' => false,
+                'message' => 'Currency pair not available for trading',
+            ];
+        }
+
+        // A halted pair cannot trade, even if the assets are tradeable.
+        if (app(\App\Domain\Asset\Services\TradingPairService::class)->isHalted(
+            $orderProjection->base_currency,
+            $orderProjection->quote_currency
+        )) {
+            return (object) [
+                'isValid' => false,
+                'message' => 'Trading pair is halted',
+            ];
+        }
+
+        // Validate order amounts
+        $remainingAmount = (string) $orderProjection->remaining_amount;
+        if (! is_numeric($remainingAmount) || BigDecimal::of($remainingAmount)->isLessThanOrEqualTo(0)) {
+            return (object) [
+                'isValid' => false,
+                'message' => 'Invalid order amount',
+            ];
+        }
+
+        // For limit orders, validate price
+        $price = (string) ($orderProjection->price ?? '0');
+        if ($orderProjection->order_type === 'limit' && (! is_numeric($price) || BigDecimal::of($price)->isLessThanOrEqualTo(0))) {
+            return (object) [
+                'isValid' => false,
+                'message' => 'Invalid limit price',
+            ];
+        }
+
+        return (object) [
+            'isValid'       => true,
+            'message'       => 'Order is valid',
+            'order'         => $orderProjection,
+            'account'       => $account,
+            'baseCurrency'  => $baseCurrency,
+            'quoteCurrency' => $quoteCurrency,
+        ];
+    }
+}
