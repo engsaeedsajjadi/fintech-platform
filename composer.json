@@ -33,7 +33,7 @@
         "aws/aws-sdk-php": "^3.369.35",
         "barryvdh/laravel-dompdf": "^3.1",
         "darkaonline/l5-swagger": "^11.0",
-        "durable-workflow/waterline": "^1.0",
+        "durable-workflow/waterline": "^2.19",
         "durable-workflow/workflow": "^1.0",
         "endroid/qr-code": "^6.0",
         "filament/filament": "^3.0",
