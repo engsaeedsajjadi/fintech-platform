@@ -1,0 +1,50 @@
+type RegulatoryReport @model(class: "App\\Domain\\Regulatory\\Models\\RegulatoryReport") {
+    id: ID!
+    report_id: String
+    report_type: String!
+    jurisdiction: String!
+    status: String!
+    priority: Int
+    is_mandatory: Boolean
+    is_overdue: Boolean
+    due_date: DateTime
+    reporting_period_start: Date
+    reporting_period_end: Date
+    submitted_at: DateTime
+    submitted_by: String
+    reviewed_at: DateTime
+    created_at: DateTime!
+    updated_at: DateTime!
+}
+
+input SubmitReportInput {
+    report_type: String!
+    jurisdiction: String!
+    reporting_period_start: Date
+    reporting_period_end: Date
+}
+
+extend type Query @module(name: "Regulatory") {
+    "Get a regulatory report by ID (compliance staff only)."
+    regulatoryReport(id: ID! @eq): RegulatoryReport
+        @find
+        @builder(method: "App\\GraphQL\\Builders\\StaffOnly@compliance")
+        @guard(with: ["sanctum"])
+
+    "List regulatory reports (compliance staff only)."
+    regulatoryReports(
+        page: Int @rules(apply: ["integer", "min:1"])
+        first: Int @rules(apply: ["integer", "min:1", "max:100"])
+        status: String @where(operator: "=")
+        jurisdiction: String @where(operator: "=")
+    ): [RegulatoryReport!]!
+        @paginate(defaultCount: 15, model: "App\\Domain\\Regulatory\\Models\\RegulatoryReport")
+        @builder(method: "App\\GraphQL\\Builders\\StaffOnly@compliance")
+        @guard(with: ["sanctum"])
+}
+
+extend type Mutation @module(name: "Regulatory") {
+    submitReport(input: SubmitReportInput! @spread): RegulatoryReport!
+        @guard(with: ["sanctum"])
+        @field(resolver: "App\\GraphQL\\Mutations\\Regulatory\\SubmitReportMutation")
+}

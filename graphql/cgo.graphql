@@ -1,0 +1,44 @@
+type CgoInvestment @model(class: "App\\Domain\\Cgo\\Models\\CgoInvestment") {
+    id: ID!
+    uuid: String
+    amount: Float!
+    currency: String
+    status: String!
+    tier: String
+    share_price: Float
+    shares_purchased: Float
+    ownership_percentage: Float
+    payment_method: String
+    payment_status: String
+    kyc_level: String
+    created_at: DateTime!
+    updated_at: DateTime!
+}
+
+input CreateInvestmentInput {
+    amount: Float!
+    currency: String
+    payment_method: String
+}
+
+extend type Query @module(name: "Cgo") {
+    investment(id: ID! @eq): CgoInvestment
+        @find
+        @builder(method: "App\\GraphQL\\Builders\\OwnedByUser@userId")
+        @guard(with: ["sanctum"])
+
+    investments(
+        page: Int @rules(apply: ["integer", "min:1"])
+        first: Int @rules(apply: ["integer", "min:1", "max:100"])
+        status: String @where(operator: "=")
+    ): [CgoInvestment!]!
+        @paginate(defaultCount: 15, model: "App\\Domain\\Cgo\\Models\\CgoInvestment")
+        @builder(method: "App\\GraphQL\\Builders\\OwnedByUser@userId")
+        @guard(with: ["sanctum"])
+}
+
+extend type Mutation @module(name: "Cgo") {
+    createInvestment(input: CreateInvestmentInput! @spread): CgoInvestment!
+        @guard(with: ["sanctum"])
+        @field(resolver: "App\\GraphQL\\Mutations\\Cgo\\CreateInvestmentMutation")
+}

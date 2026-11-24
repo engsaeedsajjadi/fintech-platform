@@ -1,0 +1,30 @@
+type Certificate @model(class: "App\\Domain\\TrustCert\\Models\\Certificate") {
+    id: ID!
+    user_id: ID!
+    subject: String!
+    issuer_type: String!
+    status: String!
+    credential_type: String!
+    issued_at: DateTime
+    expires_at: DateTime
+    revoked_at: DateTime
+    revocation_reason: String
+    created_at: DateTime!
+    updated_at: DateTime!
+}
+
+extend type Query @module(name: "TrustCert") {
+    certificate(id: ID! @eq): Certificate
+        @find
+        @builder(method: "App\\GraphQL\\Builders\\OwnedByUser@userId")
+        @guard(with: ["sanctum"])
+
+    certificates(
+        page: Int @rules(apply: ["integer", "min:1"])
+        first: Int @rules(apply: ["integer", "min:1", "max:100"])
+        status: String @where(operator: "=")
+    ): [Certificate!]!
+        @paginate(defaultCount: 15, model: "App\\Domain\\TrustCert\\Models\\Certificate")
+        @builder(method: "App\\GraphQL\\Builders\\OwnedByUser@userId")
+        @guard(with: ["sanctum"])
+}

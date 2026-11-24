@@ -1,0 +1,33 @@
+type MobileDevice @model(class: "App\\Domain\\Mobile\\Models\\MobileDevice") {
+    id: ID!
+    user_id: ID!
+    device_id: String!
+    platform: String!
+    device_name: String
+    device_model: String
+    os_version: String
+    app_version: String
+    biometric_enabled: Boolean!
+    passkey_enabled: Boolean!
+    is_trusted: Boolean!
+    is_blocked: Boolean!
+    last_active_at: DateTime
+    created_at: DateTime!
+    updated_at: DateTime!
+}
+
+extend type Query @module(name: "Mobile") {
+    mobileDevice(id: ID! @eq): MobileDevice
+        @find
+        @builder(method: "App\\GraphQL\\Builders\\OwnedByUser@userId")
+        @guard(with: ["sanctum"])
+
+    mobileDevices(
+        page: Int @rules(apply: ["integer", "min:1"])
+        first: Int @rules(apply: ["integer", "min:1", "max:100"])
+        platform: String @where(operator: "=")
+    ): [MobileDevice!]!
+        @paginate(defaultCount: 15, model: "App\\Domain\\Mobile\\Models\\MobileDevice")
+        @builder(method: "App\\GraphQL\\Builders\\OwnedByUser@userId")
+        @guard(with: ["sanctum"])
+}
