@@ -65,27 +65,28 @@ class SafeDealSettlementService
             throw new SafeDealException('Cannot fund a trade with a non-positive amount.');
         }
 
-        $this->ensureAccount($this->buyerAccountCode($trade), "SafeDeal buyer {$trade->buyer_id}", AccountType::LIABILITY, $trade->currency);
+        $buyerAccount = $this->buyerAccountCode($trade);
+        $this->ensureAccount($buyerAccount, "SafeDeal buyer {$trade->buyer_id}", AccountType::LIABILITY, $trade->currency);
         $this->ensureAccount($this->escrowAccountCode($trade), "SafeDeal escrow {$trade->trade_id}", AccountType::LIABILITY, $trade->currency);
 
-        $entry = $this->ledger->postIdempotent(
-            "safedeal-fund:{$trade->trade_id}",
+        // Funding consumes the buyer's funded liability balance. The Ledger
+        // guard locks the account, checks its natural-side balance, and
+        // attaches the idempotency claim atomically with the journal entry.
+        $entry = $this->ledger->postGuarded(
             "SafeDeal funding {$trade->trade_id}",
             [
-                // Buyer balance decreases (liability, debit), escrow holding
-                // increases (liability, credit).
-                ['account_code' => $this->buyerAccountCode($trade), 'debit' => $amount, 'credit' => '0.0000', 'currency' => $trade->currency, 'narrative' => "SafeDeal funding {$trade->trade_id}"],
+                ['account_code' => $buyerAccount, 'debit' => $amount, 'credit' => '0.0000', 'currency' => $trade->currency, 'narrative' => "SafeDeal funding {$trade->trade_id}"],
                 ['account_code' => $this->escrowAccountCode($trade), 'debit' => '0.0000', 'credit' => $amount, 'currency' => $trade->currency, 'narrative' => "SafeDeal funding {$trade->trade_id}"],
             ],
+            [$buyerAccount],
             'SafeDeal',
             $trade->trade_id,
+            "safedeal-fund:{$trade->trade_id}",
         );
 
         $this->rememberEntry($trade, $entry);
-
         return $entry;
     }
-
     /**
      * Settlement: escrow -> seller. Idempotent on `safedeal-settle:{trade}`.
      * For a SPLIT dispute resolution the seller share is posted and the
