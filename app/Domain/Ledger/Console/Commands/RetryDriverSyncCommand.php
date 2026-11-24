@@ -4,12 +4,8 @@ declare(strict_types=1);
 
 namespace App\Domain\Ledger\Console\Commands;
 
-use App\Domain\Ledger\Contracts\LedgerDriverInterface;
-use App\Domain\Ledger\Services\Drivers\EloquentDriver;
-use App\Domain\Ledger\Services\Drivers\TigerBeetleDriver;
 use App\Domain\Ledger\Services\ReconciliationService;
 use Illuminate\Console\Command;
-use RuntimeException;
 
 /**
  * Replay pending external-driver syncs from the outbox.
@@ -24,9 +20,7 @@ use RuntimeException;
  * 1 when any row is still pending/failed. This command never posts a
  * journal entry and never changes a balance.
  *
- * NOTE: the driver is resolved from `ledger.driver` here, not from the
- * container binding — AppServiceProvider hardcodes the Eloquent driver
- * and ignores that config key (known gap, see report).
+ * The driver is resolved from the same container binding used by LedgerService.
  */
 final class RetryDriverSyncCommand extends Command
 {
@@ -37,24 +31,11 @@ final class RetryDriverSyncCommand extends Command
 
     public function handle(): int
     {
-        $driver = $this->resolveDriver();
-        $service = new ReconciliationService($driver);
-
+        $service = app(ReconciliationService::class);
         $result = $service->retryPendingDriverSyncs((int) $this->option('limit'));
 
         $this->info("Driver sync retry: {$result['retried']} retried, {$result['synced']} synced, {$result['failed']} still failing.");
 
         return $result['failed'] === 0 ? self::SUCCESS : self::FAILURE;
-    }
-
-    private function resolveDriver(): LedgerDriverInterface
-    {
-        return match (strtolower((string) config('ledger.driver', 'eloquent'))) {
-            'tigerbeetle', 'tiger_beetle' => new TigerBeetleDriver(),
-            'eloquent'                    => new EloquentDriver(),
-            default                       => throw new RuntimeException(
-                "Unknown ledger driver '" . (string) config('ledger.driver') . "' — expected 'eloquent' or 'tigerbeetle'."
-            ),
-        };
     }
 }
