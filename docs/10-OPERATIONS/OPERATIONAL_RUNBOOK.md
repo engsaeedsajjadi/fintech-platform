@@ -1,0 +1,835 @@
+# Operational Runbook
+
+This runbook describes how to operate a FinAegis deployment, such as the Zelta production server. It covers daily operations, incident response, maintenance, rollback and disaster recovery.
+
+The commands below exist in the codebase at v7.18.1 unless a line says it is a manual step. Queue workers run either under Horizon (`config/horizon.php`) or under Supervisor with `etc/supervisor.conf`. The Zelta production server uses Supervisor. The Kubernetes examples assume the Helm chart in `helm/finaegis` installed as release `finaegis`, which creates the deployments `finaegis-web`, `finaegis-horizon` and `finaegis-scheduler`.
+
+## Table of Contents
+
+1. [Quick Reference](#quick-reference)
+2. [Daily Operations](#daily-operations)
+3. [Incident Response](#incident-response)
+4. [Common Scenarios](#common-scenarios)
+5. [Maintenance Procedures](#maintenance-procedures)
+6. [Rollback Procedures](#rollback-procedures)
+7. [Disaster Recovery](#disaster-recovery)
+8. [Runbook Templates](#runbook-templates)
+
+---
+
+## Quick Reference
+
+### Critical Commands
+
+```bash
+# Application Status
+php artisan about                    # Application overview
+php artisan horizon:status           # Horizon status (when workers run under Horizon)
+supervisorctl status                 # Worker status (when workers run under Supervisor)
+php artisan config:show database     # Database configuration
+
+# Deploy preflight
+php artisan ops:verify-env           # exit 1 = blocked; FAILs block in production (or with --strict)
+
+# Health Checks
+curl -s http://localhost/api/monitoring/health   # Component health (database, cache, ...)
+curl -s http://localhost/api/monitoring/ready    # Readiness probe
+curl -s http://localhost/api/monitoring/alive    # Liveness probe
+php artisan system:health-check --deep           # Same checks from the CLI
+
+# Emergency Commands
+php artisan down --secret="emergency-bypass-token"  # Maintenance mode
+php artisan up                                       # Exit maintenance
+php artisan horizon:terminate                        # Stop Horizon workers (Supervisor restarts them)
+php artisan queue:restart                            # Ask plain queue:work workers to restart
+php artisan queue:retry all                          # Retry failed jobs
+```
+
+### User & Admin Management
+
+```bash
+# Create a new user (interactive — prompts for name, email, password)
+php artisan user:create
+
+# Create an admin user (one-liner for automation)
+php artisan user:create --name="Jane Admin" --email=jane@company.com --password=SecureP@ss123 --admin
+
+# Promote an existing user to admin
+php artisan user:promote jane@company.com
+
+# Promote to super_admin (Filament full access)
+php artisan user:promote jane@company.com --role=super_admin
+
+# Review staff role assignments
+php artisan user:audit-staff-roles
+
+# Remove admin role
+php artisan user:demote jane@company.com
+
+# List all admin users
+php artisan user:admins
+```
+
+**Registration control.** Two settings control who can create an account. `REGISTRATION_ENABLED` controls the web registration form, which is off by default in production. `REGISTRATION_API_ENABLED` controls every API sign-up path. These are password sign-up, the first Privy login (mobile and web email code) and the first social login. It is off by default in production, and `ops:verify-env` fails a production deploy that does not set it. `.env.zelta.example` sets it to `true`, so Zelta accepts new users through the app. Set `REGISTRATION_API_INVITE_ONLY=true` to accept only people with an admin invitation (`php artisan user:invite`). Existing users can always sign in, and `user:create` always works. In local, testing and demo environments both kinds of registration are on by default.
+
+### Key Metrics Thresholds
+
+| Metric | Warning | Critical |
+|--------|---------|----------|
+| Response Time (p95) | > 500ms | > 2000ms |
+| Error Rate | > 1% | > 5% |
+| CPU Usage | > 70% | > 90% |
+| Memory Usage | > 75% | > 90% |
+| Queue Length | > 1000 | > 5000 |
+| Failed Jobs | > 10/hour | > 50/hour |
+| Database Connections | > 80% | > 95% |
+
+### Escalation Contacts
+
+| Level | Contact | Response Time |
+|-------|---------|---------------|
+| L1 | On-call Engineer | 15 minutes |
+| L2 | Team Lead | 30 minutes |
+| L3 | CTO | 1 hour |
+| L4 | CEO | 2 hours |
+
+---
+
+## Daily Operations
+
+### Morning Checklist
+
+```markdown
+[ ] Review overnight alerts and incidents
+[ ] Check dashboard for anomalies
+[ ] Verify queue processing is healthy
+[ ] Review failed jobs and address critical ones
+[ ] Check disk space across all servers
+[ ] Verify backup completion
+[ ] Review security alerts
+```
+
+### Daily Tasks
+
+#### 1. System Health Check
+
+```bash
+# Check all services are running
+kubectl get pods -n finaegis -o wide
+
+# Check recent errors
+kubectl logs deployment/finaegis-web -n finaegis --since=1h | grep -i error
+
+# Check queue health
+php artisan horizon:status      # or: supervisorctl status
+php artisan queue:failed        # list failed jobs
+
+# Check database connections
+php artisan tinker --execute="echo DB::connection()->getPdo() ? 'OK' : 'FAIL';"
+```
+
+#### 2. Financial Reconciliation
+
+```bash
+# Run daily reconciliation (real command; the scheduler also runs this — see routes/console.php)
+php artisan reconciliation:daily
+
+# Check for discrepancies — no separate report command; reconciliation:daily logs/surfaces
+# discrepancies itself. Review its output and storage/logs for flagged accounts (manual).
+
+# Verify projector / event-sourcing health (real command)
+php artisan projector:health
+```
+
+#### 3. Compliance Checks
+
+```bash
+# Report drafts (the scheduler already runs ctr and kyc daily, sar weekly, summary monthly)
+php artisan compliance:generate-reports --type=summary
+
+# Fraud anomaly scan (the scheduler runs it every hour by default; FRAUD_BATCH_SCHEDULE changes this)
+php artisan fraud:scan-anomalies
+
+# Open incidents and approaching GDPR breach-notification deadlines
+php artisan compliance:incident list
+php artisan gdpr:breach-check
+```
+
+Compliance alerts and flagged accounts are reviewed in the Filament admin panel. There is no CLI command that lists blocked accounts.
+
+#### 4. Performance Review
+
+```bash
+# Performance baseline report
+php artisan performance:report --format=markdown
+
+# Projector lag and failures
+php artisan projector:health --stale-only
+
+# Slow queries: read the MySQL slow query log (manual)
+# Cache hit rates: redis-cli INFO stats  (keyspace_hits / keyspace_misses) (manual)
+```
+
+The Prometheus endpoint `/api/monitoring/prometheus` also reports request counts, average response time and cache hits. See [MONITORING/monitoring.md](MONITORING/monitoring.md).
+
+### Evening Checklist
+
+```markdown
+[ ] Verify all scheduled jobs completed
+[ ] Review error rates for the day
+[ ] Check pending transactions queue
+[ ] Verify nightly backup job is scheduled
+[ ] Document any notable events
+[ ] Hand off to on-call if needed
+```
+
+---
+
+## Incident Response
+
+### Incident Severity Levels
+
+| Severity | Definition | Response Time | Examples |
+|----------|------------|---------------|----------|
+| SEV-1 | Complete outage | 15 min | Platform down, data breach |
+| SEV-2 | Major degradation | 30 min | Payment processing failed |
+| SEV-3 | Partial degradation | 2 hours | Slow response times |
+| SEV-4 | Minor issue | 4 hours | Non-critical bug |
+
+### Incident Response Workflow
+
+#### Step 1: Acknowledge
+
+```bash
+# Create incident ticket
+# Notify on-call team
+# Start incident channel
+
+# Example PagerDuty acknowledgment
+curl -X POST https://events.pagerduty.com/v2/enqueue \
+  -H "Content-Type: application/json" \
+  -d '{"routing_key": "SERVICE_KEY", "event_action": "acknowledge"}'
+```
+
+#### Step 2: Assess
+
+```bash
+# Check system status
+php artisan system:health-check --deep
+
+# Check recent deployments
+git log --oneline -10
+
+# Check the environment guards
+php artisan ops:verify-env
+
+# Check error spikes — no automated command; grep the structured logs (manual procedure)
+grep -c '"level":"error"' storage/logs/laravel.log
+grep '"level":"error"' storage/logs/laravel.log | tail -50
+# Kubernetes: kubectl logs deployment/finaegis-web -n finaegis --since=1h | grep -i error | sort | uniq -c | sort -rn
+
+# Check infrastructure
+kubectl get events -n finaegis --sort-by='.lastTimestamp'
+```
+
+#### Step 3: Mitigate
+
+**For Application Issues:**
+```bash
+# Enable maintenance mode
+php artisan down --secret="bypass-token-here"
+
+# Rollback to previous version (if needed)
+kubectl rollout undo deployment/finaegis-web -n finaegis
+
+# Scale up resources (if needed)
+kubectl scale deployment/finaegis-web -n finaegis --replicas=5
+```
+
+**For Database Issues:**
+```bash
+# Kill long-running queries
+mysql -e "KILL QUERY <process_id>;"
+
+# Clear database cache
+php artisan cache:clear
+php artisan config:clear
+
+# Failover to replica (if needed)
+# Update .env DB_HOST to replica
+php artisan config:cache
+```
+
+**For Queue Issues:**
+```bash
+# Terminate stuck workers
+php artisan horizon:terminate            # Horizon
+supervisorctl restart finaegis-workers:* # Supervisor
+
+# Clear failed jobs (after review)
+php artisan queue:flush
+
+# Start Horizon again (Supervisor or Kubernetes normally does this)
+php artisan horizon
+```
+
+#### Step 4: Resolve
+
+```bash
+# Exit maintenance mode
+php artisan up
+
+# Verify all systems operational
+php artisan system:health-check --deep
+
+# Run smoke tests
+./vendor/bin/pest tests/Feature/SmokeTest.php
+```
+
+#### Step 5: Post-Incident
+
+```markdown
+## Post-Incident Review Template
+
+**Incident ID**: INC-YYYY-MM-DD-XXX
+**Duration**: [start] to [end]
+**Impact**: [describe user impact]
+
+### Timeline
+- HH:MM - [First detection]
+- HH:MM - [Incident acknowledged]
+- HH:MM - [Root cause identified]
+- HH:MM - [Mitigation applied]
+- HH:MM - [Incident resolved]
+
+### Root Cause
+[Describe the underlying cause]
+
+### Action Items
+- [ ] [Immediate fix]
+- [ ] [Preventive measure]
+- [ ] [Monitoring improvement]
+
+### Lessons Learned
+[What we learned from this incident]
+```
+
+---
+
+## Common Scenarios
+
+### Scenario 1: High Queue Backlog
+
+**Symptoms:**
+- Queue length > 5000
+- Job processing delays
+- User complaints about pending operations
+
+**Resolution:**
+```bash
+# Check queue status
+php artisan horizon:status
+redis-cli LLEN queues:default
+
+# Check queue sizes against a threshold
+php artisan queue:monitor redis:default,redis:events,redis:transfers --max=1000
+
+# Scale up workers
+kubectl scale deployment/finaegis-horizon -n finaegis --replicas=5
+
+# If specific queue is stuck, pause and resume it
+php artisan queue:pause redis:default
+php artisan queue:resume redis:default
+
+# Check failed jobs
+php artisan queue:failed
+```
+
+### Scenario 2: Database Connection Exhaustion
+
+**Symptoms:**
+- "Too many connections" errors
+- Slow response times
+- Connection timeout errors
+
+**Resolution:**
+```bash
+# Check current connections
+mysql -e "SHOW STATUS LIKE 'Threads_connected';"
+mysql -e "SHOW PROCESSLIST;"
+
+# Kill idle connections
+mysql -e "SELECT CONCAT('KILL ', id, ';') FROM information_schema.processlist WHERE command = 'Sleep' AND time > 300;" | mysql
+
+# Restart PHP-FPM to reset connections
+sudo systemctl restart php-fpm
+
+# Check open connections per database
+php artisan db:monitor --max=100
+
+# Long-term: raise max_connections in MySQL or lower the PHP-FPM and worker counts (manual)
+```
+
+### Scenario 3: Memory Pressure
+
+**Symptoms:**
+- OOM (Out of Memory) kills
+- Slow performance
+- Worker crashes
+
+**Resolution:**
+```bash
+# Check memory usage
+free -h
+docker stats
+
+# Identify memory hogs
+ps aux --sort=-%mem | head -20
+
+# Clear caches
+php artisan cache:clear
+php artisan view:clear
+php artisan config:clear
+
+# For Kubernetes
+kubectl top pods -n finaegis
+
+# Scale up memory (if needed)
+kubectl set resources deployment/finaegis-web -n finaegis --limits=memory=2Gi
+```
+
+### Scenario 4: Payment Processing Failure
+
+**Symptoms:**
+- Payment jobs failing
+- User payment errors
+- Webhook processing delays
+
+**Resolution:**
+```bash
+# Check payment provider status
+curl -s https://status.stripe.com/api/v2/status.json
+
+# Review failed jobs (there is no separate payments queue; filter the output by job class)
+php artisan queue:failed
+
+# Retry specific failed job
+php artisan queue:retry <job-id>
+
+# Retry failed outgoing webhooks
+php artisan webhooks:retry-failed --limit=100
+
+# Wallet send or card top-up stuck: inspect the user
+php artisan wallet:inspect-user user@example.com
+php artisan cards:inspect-user user@example.com
+php artisan bridge:inspect-user user@example.com
+```
+
+### Scenario 5: Certificate Expiration
+
+**Symptoms:**
+- SSL/TLS errors
+- HTTPS failures
+- API connection errors
+
+**Resolution:**
+```bash
+# Check certificate expiration
+echo | openssl s_client -connect your-domain.com:443 2>/dev/null | openssl x509 -noout -dates
+
+# Renew with certbot
+sudo certbot renew
+
+# For Kubernetes cert-manager
+kubectl describe certificate finaegis-tls -n finaegis
+
+# Force certificate renewal
+kubectl delete secret finaegis-tls -n finaegis
+# cert-manager will auto-create new one
+
+# Restart ingress
+kubectl rollout restart deployment/nginx-ingress-controller -n ingress-nginx
+```
+
+### Scenario 6: Event Sourcing Projection Lag
+
+**Symptoms:**
+- Read model out of sync
+- Missing recent data
+- Projection queue growing
+
+**Resolution:**
+```bash
+# Check projection status
+php artisan projector:health
+
+# Show only stale or failed projectors
+php artisan projector:health --stale-only
+
+# Replay one projector (if needed)
+php artisan event-sourcing:replay "App\\Domain\\Account\\Projectors\\AccountProjector"
+
+# Replay all projectors (caution: resource intensive; --force skips the prompt)
+php artisan event-sourcing:replay --force
+
+# Replay from a given event number or for one aggregate
+php artisan event-sourcing:replay --from=<event-number> --aggregate-uuid=<uuid>
+```
+
+---
+
+## Maintenance Procedures
+
+### Scheduled Maintenance Window
+
+**Pre-Maintenance:**
+```bash
+# 1. Notify users (24 hours before) — manual: there is no maintenance-notice command
+
+# 2. Create database snapshot
+mysqldump -h $DB_HOST -u $DB_USER -p$DB_PASS $DB_NAME | gzip > backup_pre_maintenance.sql.gz
+
+# 3. Document current state
+php artisan about > system_state_before.txt
+php artisan horizon:status >> system_state_before.txt
+```
+
+**During Maintenance:**
+```bash
+# 1. Enable maintenance mode
+php artisan down --secret="maintenance-bypass-token" --render="errors::503"
+
+# 2. Stop queue workers
+php artisan horizon:terminate            # or: supervisorctl stop finaegis-workers:*
+
+# 3. Perform maintenance tasks
+# [Your maintenance commands here]
+
+# 4. Check the environment, then run migrations (if any)
+php artisan ops:verify-env
+php artisan migrate --force
+php artisan tenants:migrate              # multi-database tenancy only
+
+# 5. Clear caches
+php artisan optimize:clear
+php artisan optimize
+
+# 6. Restart queue workers
+php artisan horizon &                    # or: supervisorctl start finaegis-workers:*
+```
+
+**Post-Maintenance:**
+```bash
+# 1. Verify system health
+php artisan system:health-check --deep
+
+# 2. Run smoke tests
+./vendor/bin/pest tests/Feature/SmokeTest.php
+
+# 3. Exit maintenance mode
+php artisan up
+
+# 4. Monitor for 30 minutes
+# Watch dashboards and logs
+
+# 5. Send all-clear notification (manual)
+```
+
+### Database Maintenance
+
+#### Index Optimization
+```bash
+# Analyze tables
+mysql -e "ANALYZE TABLE accounts, transactions, ledger_entries, orders;"
+
+# Optimize tables (during low traffic)
+mysql -e "OPTIMIZE TABLE accounts, transactions, ledger_entries, orders;"
+
+# Check for fragmentation
+mysql -e "SELECT TABLE_NAME, DATA_FREE FROM information_schema.TABLES WHERE TABLE_SCHEMA='finaegis' AND DATA_FREE > 0;"
+```
+
+#### Event Store Maintenance
+```bash
+# Event counts per domain
+php artisan event:stats
+
+# Archive old events (before a date)
+php artisan event:archive --before=2025-11-23
+
+# Compact the event store (preview first)
+php artisan event:compact --keep-latest=100 --dry-run
+
+# Create snapshots
+php artisan snapshot:create --type=all
+```
+
+### Log Rotation
+
+```bash
+# Laravel logs
+logrotate /etc/logrotate.d/laravel
+
+# Custom log rotation configuration
+# /etc/logrotate.d/finaegis
+/var/www/html/storage/logs/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 640 www-data www-data
+}
+```
+
+---
+
+## Rollback Procedures
+
+### Application Rollback
+
+```bash
+# 1. Identify current version
+kubectl get deployment/finaegis-web -n finaegis -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+# 2. List rollout history
+kubectl rollout history deployment/finaegis-web -n finaegis
+
+# 3. Rollback to previous version
+kubectl rollout undo deployment/finaegis-web -n finaegis
+
+# 4. Rollback to specific revision
+kubectl rollout undo deployment/finaegis-web -n finaegis --to-revision=3
+
+# 5. Verify rollback
+kubectl rollout status deployment/finaegis-web -n finaegis
+
+# Roll back finaegis-horizon and finaegis-scheduler the same way
+```
+
+### Database Migration Rollback
+
+```bash
+# Rollback last migration
+php artisan migrate:rollback --step=1
+
+# Rollback to specific batch
+php artisan migrate:rollback --batch=15
+
+# Full database restore (if needed)
+gunzip < backup_pre_migration.sql.gz | mysql -h $DB_HOST -u $DB_USER -p$DB_PASS $DB_NAME
+```
+
+### Event Sourcing Rollback
+
+```bash
+# Event sourcing is append-only, so we create compensating events
+
+# 1. Identify problematic events (manual SQL)
+mysql -e "SELECT id, event_class, created_at FROM stored_events WHERE aggregate_uuid='<uuid>' ORDER BY id;"
+
+# 2. Create compensating events — manual: record them through the domain's
+#    aggregate (for example a reversal), never by editing stored_events
+
+# 3. Rebuild projections
+php artisan event-sourcing:replay --from=<event-number> --force
+php artisan event:rebuild <AggregateClass> --uuid=<uuid>
+```
+
+---
+
+## Disaster Recovery
+
+### Recovery Time Objectives
+
+| Scenario | RTO | RPO | Priority |
+|----------|-----|-----|----------|
+| Complete Outage | 4 hours | 24h (same nightly dump as below) | P1 |
+| Database Failure | 2 hours | **24h** (nightly `backup:run` dump; PITR/binlog shipping required for a lower RPO) | P1 |
+| Application Failure | 30 minutes | N/A | P2 |
+| Region Failure | 8 hours | 24h (same nightly dump as below) | P1 |
+
+### Full System Recovery
+
+#### Step 1: Infrastructure
+
+```bash
+# Deploy infrastructure from IaC
+terraform init
+terraform apply -auto-approve
+
+# Verify infrastructure
+kubectl get nodes
+kubectl get services -n finaegis
+```
+
+#### Step 2: Database Recovery
+
+```bash
+# Fetch the latest backup zip from the BACKUP_DISK destination (manual).
+# spatie/laravel-backup zips hold db-dumps/mysql-<database>.sql.
+unzip -p latest_backup.zip 'db-dumps/*.sql' > database.sql
+
+# Import to new database
+mysql -h $NEW_DB_HOST -u root -p <database> < database.sql
+
+# Verify data integrity — verify the transaction hash chain (real command)
+php artisan app:verify-transaction-hashes
+```
+
+#### Step 3: Application Deployment
+
+```bash
+# Deploy application
+helm upgrade --install finaegis helm/finaegis -n finaegis -f helm/finaegis/values-production.yaml
+
+# Wait for pods to be ready
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=finaegis -n finaegis --timeout=300s
+
+# Check the environment and run migrations
+kubectl exec -it deployment/finaegis-web -n finaegis -- php artisan ops:verify-env
+kubectl exec -it deployment/finaegis-web -n finaegis -- php artisan migrate --force
+```
+
+#### Step 4: Verification
+
+```bash
+# Health checks
+curl -s https://finaegis.example.com/api/monitoring/health
+
+# Run smoke tests
+./vendor/bin/pest tests/Feature/SmokeTest.php
+
+# Verify financial integrity — run the daily reconciliation (real command; --force re-runs even if done today)
+php artisan reconciliation:daily --force
+```
+
+### Backup Verification
+
+> Scheduled DB backups run via **spatie/laravel-backup**: `backup:run --only-db`
+> daily at 01:30 UTC and `backup:clean` at 02:30 UTC (`routes/console.php`,
+> production-only, `Log::critical` on failure → Slack via the LOG stack).
+> There is no `backup:verify` command — the real commands are:
+>
+> - `php artisan backup:list` — show every backup on the destination disk(s) with size + age
+> - `php artisan backup:monitor` — health-check backups against `config/backup.php`
+>   `monitor_backups` (max age 1 day, max storage); non-zero output = unhealthy
+>
+> Destination disk is `BACKUP_DISK` (default `local`; production must use `s3` —
+> see the Production Readiness Checklist §9). Restoration is still a manual drill:
+
+```bash
+# Daily/weekly verification (real artisan commands)
+php artisan backup:list
+php artisan backup:monitor
+
+# Monthly backup restoration test (manual procedure)
+# 1. Start a throwaway database on port 3307
+docker run -d --name finaegis-restore-test -e MYSQL_ROOT_PASSWORD=restore-test -p 3307:3306 mysql:8.0
+
+# 2. Fetch the latest backup zip from the BACKUP_DISK destination
+#    (spatie zips contain db-dumps/mysql-<database>.sql), then restore:
+unzip -p latest_backup.zip db-dumps/*.sql | mysql -h localhost -P 3307 -u root -p
+
+# 3. Run verification queries against the restored copy (manual SQL — adjust to your data):
+#    confirm row counts and the latest transaction timestamp look sane, then spot-check
+#    the transaction hash chain on the restored connection:
+php artisan app:verify-transaction-hashes      # run against the restored DB connection
+mysql -h localhost -P 3307 -u root -p -e "SELECT MAX(created_at) FROM transactions;"
+
+# 4. Remove the throwaway database
+docker rm -f finaegis-restore-test
+```
+
+---
+
+## Runbook Templates
+
+### Template: New Release Deployment
+
+```markdown
+## Release Deployment: v[VERSION]
+
+**Date**: YYYY-MM-DD
+**Lead**: [Engineer Name]
+**Status**: [ ] Pending | [ ] In Progress | [ ] Complete | [ ] Rolled Back
+
+### Pre-Deployment
+- [ ] Changelog reviewed
+- [ ] Migration scripts reviewed
+- [ ] Rollback plan prepared
+- [ ] Stakeholders notified
+- [ ] Backup created
+
+### Deployment Steps
+- [ ] Enable maintenance mode
+- [ ] Stop queue workers
+- [ ] Run `php artisan ops:verify-env` against the new environment
+- [ ] Deploy new version: `helm upgrade finaegis helm/finaegis --set image.tag=v[VERSION]`
+- [ ] Run migrations: `kubectl exec deployment/finaegis-web -- php artisan migrate --force`
+- [ ] Clear caches
+- [ ] Start queue workers
+- [ ] Exit maintenance mode
+- [ ] Run smoke tests
+
+### Post-Deployment
+- [ ] Monitor dashboards (15 min)
+- [ ] Verify key metrics
+- [ ] Update deployment log
+- [ ] Notify stakeholders
+
+### Rollback Trigger
+If any of these occur, immediately rollback:
+- [ ] Error rate > 5%
+- [ ] P95 latency > 2s
+- [ ] Critical features failing
+- [ ] Payment processing failures
+```
+
+### Template: On-Call Handoff
+
+```markdown
+## On-Call Handoff
+
+**From**: [Name] | **To**: [Name]
+**Period**: YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM
+
+### System Status
+- [ ] All services healthy
+- [ ] No active incidents
+- [ ] Queue processing normal
+- [ ] No pending deployments
+
+### Outstanding Issues
+| Issue | Severity | Status | Notes |
+|-------|----------|--------|-------|
+| | | | |
+
+### Scheduled Tasks
+| Task | Time | Impact |
+|------|------|--------|
+| | | |
+
+### Recent Changes
+- [List any recent deployments or changes]
+
+### Known Issues to Watch
+- [List any issues that need monitoring]
+
+### Handoff Confirmed
+- [ ] Outgoing engineer briefed incoming
+- [ ] Access verified (VPN, kubectl, AWS)
+- [ ] Communication channels verified
+```
+
+---
+
+## Related Documentation
+
+- [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) covers the initial deployment.
+- [SECURITY_AUDIT_CHECKLIST.md](SECURITY_AUDIT_CHECKLIST.md) is the security review checklist.
+- [PRODUCTION_READINESS_CHECKLIST.md](PRODUCTION_READINESS_CHECKLIST.md) is the launch checklist.
+- [MONITORING/monitoring.md](MONITORING/monitoring.md) describes the monitoring setup.
+- `docs/operations/` has the runbooks for Bridge, wallet sponsorship, IAP subscriptions, HyperSwitch and reviewer accounts.
+- [CLAUDE.md](../../CLAUDE.md) lists the development commands.

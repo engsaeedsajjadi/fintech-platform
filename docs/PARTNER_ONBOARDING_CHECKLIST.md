@@ -1,0 +1,80 @@
+# Partner Onboarding Checklist
+
+This checklist covers the whole process of onboarding a new partner to the Zelta payment SDK and API. The target is 14 days from kickoff to production traffic.
+
+For technical details, see [Partner Integration Guide](PARTNER_INTEGRATION_GUIDE.md).
+
+---
+
+## Phase 1: Technical Setup (Day 1-3)
+
+- [ ] Partner receives API credentials for testing and for production (API keys start with `fak_`)
+- [ ] Partner installs Zelta SDK v1.0.0 (`composer require finaegis/payment-sdk`)
+- [ ] Partner configures `PaymentConfig` with the test base URL and test API key
+- [ ] Partner completes a first test transaction (GET request with 402 auto-pay)
+- [ ] If an administrator set up a webhook for the partner: HMAC-SHA256 signature verification of `X-Webhook-Signature` confirmed working
+
+## Phase 2: Integration (Day 3-7)
+
+- [ ] Partner implements end-to-end payment flow in their product
+- [ ] Partner selects payment protocol(s): x402, MPP, or AutoDetect (both)
+- [ ] Partner reads the payment outcome from the SDK's `PaymentResult` (there are no payment webhook events for x402 or MPP payments)
+- [ ] Partner implements idempotency keys for all payment-initiating requests
+- [ ] Error handling tested for:
+  - [ ] Network timeouts
+  - [ ] Invalid API key (401)
+  - [ ] Rate limiting (429 with `Retry-After` backoff)
+  - [ ] Payment failures (`PaymentFailedException`)
+  - [ ] Missing payment handler (`PaymentRequiredException`)
+- [ ] Rate limit handling implemented with exponential backoff
+- [ ] Retry logic tested
+
+## Phase 3: Compliance (Day 7-10)
+
+- [ ] KYC/AML requirements reviewed and acknowledged
+- [ ] Data processing agreement (DPA) signed
+- [ ] Partner privacy policy updated to disclose Zelta as a technical integration provider (payments are processed by the underlying rail providers under their own terms)
+- [ ] Partner terms of service updated to cover payment protocol usage
+- [ ] PCI DSS scope confirmed (MPP card rail only; x402 is out of scope)
+- [ ] Geographic restrictions reviewed (sanctioned jurisdictions)
+
+## Phase 4: Go-Live (Day 10-14)
+
+- [ ] Production API credentials issued
+- [ ] Production base URL configured (`https://api.zelta.app`)
+- [ ] DNS configured for production endpoints (if using custom subdomain)
+- [ ] Monitoring and alerting configured:
+  - [ ] Payment failure rate alerts (threshold: > 1%)
+  - [ ] API response time degradation alerts
+- [ ] Runbook for payment incident handling documented
+- [ ] Production test transaction completed end-to-end
+- [ ] Traffic ramp-up plan agreed and scheduled:
+  - [ ] Day 1: 10% of traffic
+  - [ ] Day 3: 50% of traffic
+  - [ ] Day 5: 100% of traffic
+
+## Phase 5: Post-Launch (Day 14+)
+
+- [ ] First week metrics review completed:
+  - [ ] Transaction volume
+  - [ ] Success rate
+  - [ ] Average payment completion time
+- [ ] Error rate confirmed below 1% threshold
+- [ ] Payment reconciliation verified (amounts match between partner records and rail-provider reports)
+- [ ] Partner success contact assigned for ongoing support
+- [ ] Monthly business review cadence established
+- [ ] SDK update plan agreed (minor/patch auto-update, major manual review)
+
+---
+
+## Internal Zelta Tasks
+
+The Zelta partnerships team completes these tasks, not the partner.
+
+- [ ] Partner record created in CRM
+- [ ] API key pair generated and securely delivered
+- [ ] If the agreement includes a webhook: webhook created by a platform administrator and its secret securely delivered
+- [ ] Partner added to status page notification list
+- [ ] Production rate limits configured per agreement
+- [ ] Billing/revenue share terms finalized
+- [ ] Partner logo and listing approved for integrations page
