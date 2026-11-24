@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Tests\Domain\SafeDeal;
 
 use App\Domain\Ledger\Models\JournalEntry;
+use App\Domain\Ledger\Models\LedgerAccount;
+use App\Domain\Ledger\Services\LedgerService;
 use App\Domain\SafeDeal\Enums\TradeStatus;
 use App\Domain\SafeDeal\Exceptions\InvalidTradeTransitionException;
 use App\Domain\SafeDeal\Exceptions\SafeDealException;
@@ -46,6 +48,33 @@ class SafeDealLifecycleTest extends TestCase
         $this->admin = \App\Models\User::factory()->create();
         $this->admin->assignRole('admin');
         $this->adminId = (string) $this->admin->id;
+        $this->seedBuyerLedgerBalance();
+    }
+
+    private function seedBuyerLedgerBalance(): void
+    {
+        $buyerCode = "SAFEDEAL:BUYER:{$this->buyerId}:USD";
+        $fundingCode = 'SAFEDEAL:TEST-FUNDING:USD';
+
+        LedgerAccount::firstOrCreate(
+            ['code' => $buyerCode],
+            ['name' => 'SafeDeal test buyer balance', 'type' => 'liability', 'currency' => 'USD', 'is_active' => true],
+        );
+        LedgerAccount::firstOrCreate(
+            ['code' => $fundingCode],
+            ['name' => 'SafeDeal test funding source', 'type' => 'asset', 'currency' => 'USD', 'is_active' => true],
+        );
+
+        app(LedgerService::class)->post(
+            'SafeDeal test opening balance',
+            [
+                ['account_code' => $fundingCode, 'debit' => '1000.0000', 'credit' => '0.0000', 'currency' => 'USD'],
+                ['account_code' => $buyerCode, 'debit' => '0.0000', 'credit' => '1000.0000', 'currency' => 'USD'],
+            ],
+            'SafeDealTest',
+            "buyer-fixture:{$this->buyerId}",
+            "safedeal-test-funding:{$this->buyerId}",
+        );
     }
 
     /** @return array{trade_id: string, buyer_id: string, seller_id: string} */
@@ -88,6 +117,20 @@ class SafeDealLifecycleTest extends TestCase
         $this->assertSame(TradeStatus::FUNDED, $trade->status);
 
         return $id;
+    }
+
+    public function test_funding_refuses_to_overdraw_the_buyers_ledger_balance(): void
+    {
+        $before = JournalEntry::where('description', 'like', 'SafeDeal funding %')->count();
+
+        try {
+            $this->fundTrade('1001.0000');
+            $this->fail('SafeDeal must reject funding above the buyer ledger balance.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('overdraw ledger account', $exception->getMessage());
+        }
+
+        $this->assertSame($before, JournalEntry::where('description', 'like', 'SafeDeal funding %')->count());
     }
 
     public function test_full_lifecycle_to_settlement_with_ledger_and_audit(): void
