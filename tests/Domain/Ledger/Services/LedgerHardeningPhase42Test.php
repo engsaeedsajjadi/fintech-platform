@@ -324,8 +324,33 @@ it('records a failed driver sync in the outbox instead of failing the posting', 
     $row = LedgerDriverSync::query()->first();
     expect($row)->not->toBeNull()
         ->and($row->status)->toBe('pending')
-        ->and($row->attempts)->toBe(1)
-        ->and($row->journal_entry_id)->toBe($entry->id);
+        ->and($row->attempts)->toBe(0)
+        ->and($row->journal_entry_id)->toBe($entry->id)
+        ->and($driver->postAttempts)->toBe(0);
+
+    // Tests run inside a wrapping transaction, so after-commit dispatch is
+    // intentionally deferred. The durable outbox can still be retried.
+    $retry = (new ReconciliationService($driver))->retryPendingDriverSyncs();
+    expect($retry)->toBe(['retried' => 1, 'synced' => 0, 'failed' => 1])
+        ->and(LedgerDriverSync::query()->first()->attempts)->toBe(1)
+        ->and($driver->postAttempts)->toBe(1);
+});
+
+it('does not call an external ledger driver when the outer transaction rolls back', function (): void {
+    $driver = new Phase42FlakyDriver();
+    $ledger = new LedgerService($driver);
+
+    DB::beginTransaction();
+    $entry = $ledger->post('Outer transaction will roll back', phase42Lines());
+
+    expect($driver->postAttempts)->toBe(0)
+        ->and(LedgerDriverSync::where('journal_entry_id', $entry->id)->count())->toBe(1);
+
+    DB::rollBack();
+
+    expect($driver->postAttempts)->toBe(0)
+        ->and(JournalEntry::find($entry->id))->toBeNull()
+        ->and(LedgerDriverSync::where('journal_entry_id', $entry->id)->count())->toBe(0);
 });
 
 it('retries pending syncs and marks them synced only after the driver confirms', function (): void {
