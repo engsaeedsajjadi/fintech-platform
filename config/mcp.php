@@ -1,0 +1,192 @@
+<?php
+
+declare(strict_types=1);
+
+return [
+    'enabled' => (bool) env('MCP_ENABLED', true),
+    'host'    => env('MCP_HOST', 'mcp.zelta.app'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Wire Protocol
+    |--------------------------------------------------------------------------
+    */
+    'protocol_version' => '2025-11-25',
+    'server_info'      => [
+        'name'    => env('MCP_SERVER_NAME', 'Zelta'),
+        'version' => env('MCP_SERVER_VERSION', '0.1.0'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | OAuth & Discovery
+    |--------------------------------------------------------------------------
+    */
+    'authorization_server' => env('MCP_AUTH_SERVER', 'https://zelta.app'),
+    'resource_uri'         => env('MCP_RESOURCE_URI', 'https://mcp.zelta.app'),
+
+    'scopes' => [
+        'accounts:read'     => 'See your profile, balances, wallet addresses and activity',
+        'accounts:write'    => 'Create new accounts',
+        'payments:read'     => 'See the status of your payments',
+        'payments:write'    => 'Send payments within your daily spending limit',
+        'transactions:read' => 'See your transaction history and spending analysis',
+        'exchange:read'     => 'Get exchange rate quotes',
+        'exchange:write'    => 'Make exchange trades. Trades do not count toward the daily spending limit yet.',
+        'ramp:read'         => 'See the status of your sessions for buying or selling stablecoins',
+        'ramp:write'        => 'Start a session to buy or sell stablecoins within your daily spending limit',
+        'sms:send'          => 'Send text messages within the daily send limits and your daily spending limit',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Tool Catalog (v1)
+    |--------------------------------------------------------------------------
+    | Maps public MCP tool names to internal MCPToolInterface tool names.
+    | Disabled tools are omitted from tools/list AND return -32004 if invoked.
+    |
+    | account.create, payment.transfer and exchange.trade move internal ledger
+    | balances and default to on only for APP_ENV=local, testing or demo
+    | (off for production, staging or unset); an explicit MCP_TOOL_* value
+    | always wins (env templates from v7.16.0 and earlier set them to true
+    | explicitly — set them to false in an existing production .env). Every
+    | other tool keeps its default.
+    |
+    | `requires_config` names a config switch the tool also needs: while it is
+    | off the tool is disabled like `enabled` => false (exchange.trade follows
+    | TRADING_ENABLED). See App\Domain\MCP\Server\McpToolCatalog.
+    */
+    'tools' => [
+        // `internal` values must match the registered tool's getName() (dotted format).
+        // `requires_user` flags tools that need a user-bound bearer token;
+        // client_credentials grants (user_id=null) are rejected at dispatch.
+        // mpp.discovery is the only tool that works without a user since it's
+        // a public-rail catalog lookup.
+        // `title` is the human-readable display label exposed via tools/list
+        // annotations — required by the Anthropic Connectors Directory.
+        'account.balance'    => ['internal' => 'account.balance',                'title' => 'Get account balance',              'scope' => 'accounts:read',     'enabled' => env('MCP_TOOL_ACCOUNT_BALANCE', true),     'is_write' => false, 'requires_user' => true],
+        'account.create'     => ['internal' => 'account.create',                 'title' => 'Create a new account',             'scope' => 'accounts:write',    'enabled' => env('MCP_TOOL_ACCOUNT_CREATE', in_array(env('APP_ENV', 'production'), ['local', 'testing', 'demo'], true)), 'is_write' => true,  'requires_user' => true],
+        'payment.status'     => ['internal' => 'payment.status',                 'title' => 'Look up payment status',           'scope' => 'payments:read',     'enabled' => env('MCP_TOOL_PAYMENT_STATUS', true),      'is_write' => false, 'requires_user' => true],
+        'payment.transfer'   => ['internal' => 'payment.transfer',               'title' => 'Send a payment',                   'scope' => 'payments:write',    'enabled' => env('MCP_TOOL_PAYMENT_TRANSFER', in_array(env('APP_ENV', 'production'), ['local', 'testing', 'demo'], true)), 'is_write' => true,  'requires_user' => true, 'is_payment' => true,  'amount_arg' => 'amount',  'currency_arg' => 'currency',  'amount_decimals' => 2],
+        'transactions.query' => ['internal' => 'transactions.query',             'title' => 'Query transaction history',        'scope' => 'transactions:read', 'enabled' => env('MCP_TOOL_TRANSACTIONS_QUERY', true),  'is_write' => false, 'requires_user' => true],
+        'spending.analysis'  => ['internal' => 'transactions.spending_analysis', 'title' => 'Spending analysis by category',    'scope' => 'transactions:read', 'enabled' => env('MCP_TOOL_SPENDING_ANALYSIS', true),   'is_write' => false, 'requires_user' => true],
+        'exchange.quote'     => ['internal' => 'exchange.quote',                 'title' => 'Get an exchange rate quote',       'scope' => 'exchange:read',     'enabled' => env('MCP_TOOL_EXCHANGE_QUOTE', true),      'is_write' => false, 'requires_user' => true],
+        // exchange.trade is intentionally NOT is_payment: the spending-limit
+        // commitment is the QUOTE-currency cost (amount * market price), and
+        // market price isn't in the tool arguments. Post-execution debiting is
+        // equally blocked today: the trade result is an *order placement*
+        // (status=pending, filled_amount=0, average_fill_price=0), so there is
+        // no realized quote-currency notional to debit at response time. Wire
+        // saga coverage once the trade tool surfaces a settled fiat-equivalent
+        // in its result. Until then, all public copy must say exchange.trade
+        // is NOT counted against the daily spending limit. It is also off
+        // whenever the trading engine is (TRADING_ENABLED, `requires_config`).
+        'exchange.trade' => ['internal' => 'exchange.trade',                 'title' => 'Execute an exchange trade',        'scope' => 'exchange:write',    'enabled' => env('MCP_TOOL_EXCHANGE_TRADE', in_array(env('APP_ENV', 'production'), ['local', 'testing', 'demo'], true)), 'is_write' => true,  'requires_user' => true, 'requires_config' => 'trading.enabled'],
+        'ramp.start'     => ['internal' => 'ramp.start',                     'title' => 'Start an on/offramp session',      'scope' => 'ramp:write',        'enabled' => env('MCP_TOOL_RAMP_START', true),          'is_write' => true,  'requires_user' => true, 'is_payment' => true,  'amount_arg' => 'fiat_amount', 'currency_arg' => 'fiat_currency', 'amount_decimals' => 2],
+        'ramp.status'    => ['internal' => 'ramp.status',                    'title' => 'Check on/offramp session status',  'scope' => 'ramp:read',         'enabled' => env('MCP_TOOL_RAMP_STATUS', true),         'is_write' => false, 'requires_user' => true],
+        'mpp.discovery'  => ['internal' => 'mpp.discovery',                  'title' => 'Discover multi-rail payment routes', 'scope' => null,              'enabled' => env('MCP_TOOL_MPP_DISCOVERY', true),       'is_write' => false],
+        // sms.send is fixed-cost: every call reserves `fixed_cost_minor`
+        // against the daily limit (no amount in the tool arguments). Sends
+        // are billed to the platform and count against the unpaid SMS
+        // limits (SmsSendBudget); off by default in production.
+        'sms.send' => ['internal' => 'sms.send',                       'title' => 'Send an SMS',                      'scope' => 'sms:send',          'enabled' => env('MCP_TOOL_SMS_SEND', in_array(env('APP_ENV', 'production'), ['local', 'testing', 'demo'], true)),            'is_write' => true,  'requires_user' => true, 'is_payment' => true,  'fixed_cost_minor' => (int) env('MCP_SMS_PRICE_MINOR', 10), 'fixed_cost_currency' => 'USD'],
+        // Wallet read tools: registered blockchain addresses + the mobile
+        // activity feed. Both reuse the existing accounts:read scope — the
+        // scope list has no wallet:read, and these are same-trust-tier reads
+        // of the caller's own account surface (like account.balance).
+        'wallet.addresses' => ['internal' => 'wallet.addresses',             'title' => 'List wallet addresses',            'scope' => 'accounts:read',     'enabled' => env('MCP_TOOL_WALLET_ADDRESSES', true),    'is_write' => false, 'requires_user' => true],
+        'wallet.activity'  => ['internal' => 'wallet.activity',              'title' => 'Recent wallet activity',           'scope' => 'accounts:read',     'enabled' => env('MCP_TOOL_WALLET_ACTIVITY', true),     'is_write' => false, 'requires_user' => true],
+    ],
+
+    // ops:verify-env FAILs a production deploy while sms.send is on (sends
+    // are billed to the platform), unless the operator confirms it with
+    // MCP_TOOL_SMS_SEND_ACKNOWLEDGED=true.
+    'sms_send_acknowledged' => (bool) env('MCP_TOOL_SMS_SEND_ACKNOWLEDGED', false),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Spending Limits (per-token defaults)
+    |--------------------------------------------------------------------------
+    */
+    'spending' => [
+        'default_daily_limit_minor'    => (int) env('MCP_DEFAULT_DAILY_LIMIT_MINOR', 50000),     // $500.00
+        'default_daily_limit_currency' => (string) env('MCP_DEFAULT_DAILY_LIMIT_CURRENCY', 'USD'),
+        'consent_options_minor'        => [5000, 50000, 200000, 1000000, null],                  // null = no limit
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Idempotency
+    |--------------------------------------------------------------------------
+    */
+    'idempotency' => [
+        'cache_store' => (string) env('MCP_IDEMPOTENCY_STORE', 'redis'),
+        'ttl_seconds' => 86400,
+        // In-flight lock TTL. Must be >= the slowest rail we accept, otherwise
+        // a stalled first call lets a concurrent retry acquire the lock and
+        // double-charge. Default 300s covers Lightning HTLC + congested L1
+        // confirmation. Lower it only if all your tools are sub-minute.
+        'lock_ttl_seconds' => (int) env('MCP_IDEMPOTENCY_LOCK_TTL_SECONDS', 300),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Rate Limits (per-token unless noted)
+    |--------------------------------------------------------------------------
+    */
+    'rate_limits' => [
+        'aggregate'                   => ['per_minute' => 60, 'per_hour' => 600, 'per_day' => 5000],
+        'reads_per_minute'            => 120,
+        'writes_per_minute'           => 30,
+        'sms_per_minute'              => 10,
+        'discovery_per_minute_per_ip' => 60,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Resources (read-context primitives)
+    |--------------------------------------------------------------------------
+    */
+    'resources' => [
+        'account://profile'            => ['scope' => 'accounts:read',     'enabled' => true],
+        'account://balance/{currency}' => ['scope' => 'accounts:read',     'enabled' => true],
+        'transactions://recent'        => ['scope' => 'transactions:read', 'enabled' => true],
+        'transaction://{id}'           => ['scope' => 'transactions:read', 'enabled' => true],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Streamable HTTP transport
+    |--------------------------------------------------------------------------
+    | The MCP spec lets the server be POST-only and return 405 on GET when
+    | SSE is unsupported. We default to that posture because a long-lived SSE
+    | connection inside PHP-FPM pins a worker for the entire connection
+    | lifetime — under load that exhausts the pool. Set MCP_SSE_ENABLED=true
+    | only when running under Octane/Swoole or a dedicated SSE FPM pool.
+    */
+    'sse' => [
+        'enabled'           => (bool) env('MCP_SSE_ENABLED', false),
+        'heartbeat_seconds' => (int) env('MCP_SSE_HEARTBEAT_SECONDS', 25),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Dynamic Client Registration — branding policy
+    |--------------------------------------------------------------------------
+    | The DCR endpoint is open-by-throttle (RFC 7591 §1.1 allows this). To
+    | block the most obvious phishing path — registering a client_name like
+    | "Zelta Official" or "Stripe" to spoof a trusted brand on the consent
+    | screen — we reject any client_name whose lowercase form contains any
+    | of these reserved substrings. Operators can add brand keywords via
+    | MCP_DCR_RESERVED_NAMES (comma-separated, case-insensitive).
+    */
+    'dcr' => [
+        'reserved_name_substrings' => array_values(array_filter(array_map(
+            'trim',
+            explode(',', (string) env(
+                'MCP_DCR_RESERVED_NAMES',
+                'zelta,finaegis,anthropic,claude,openai,gpt,stripe,paysera,visa,mastercard,official,admin,system,support,security',
+            )),
+        ))),
+    ],
+];

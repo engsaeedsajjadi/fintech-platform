@@ -1,0 +1,64 @@
+version: 2
+updates:
+  - package-ecosystem: "composer"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "composer"
+    reviewers:
+      - "FinAegis/maintainers"
+    # Batch patch + minor bumps into one PR; majors stay individual.
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "symfony/http-client"
+        versions: [">=8.0.0"]
+      - dependency-name: "predis/predis"
+        versions: [">=3.0.0"]
+      - dependency-name: "laravel/cashier"
+        versions: [">=16.0.0"]
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "npm"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "tailwindcss"
+        versions: [">=4.0.0"]
+      - dependency-name: "@ledgerhq/hw-app-eth"
+        versions: [">=7.0.0"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"

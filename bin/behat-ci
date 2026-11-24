@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# Behat CI runner - runs the tag-driven acceptance suite without interaction
+# (prevents the undefined-steps prompt in CI/CD environments).
+#
+# The `ci` profile's acceptance suite excludes @wip (unimplemented specs),
+# @web (promo-page specs), @skip and @api (separate suite). Implementing a
+# deferred spec is just removing its @wip tag — there is no hardcoded feature
+# filename list here to drift out of date.
+
+export BEHAT_BASE_URL="${BEHAT_BASE_URL:-http://localhost}"
+export QUEUE_CONNECTION=sync
+
+# Default to the acceptance suite if no arguments provided
+if [ $# -eq 0 ]; then
+    exec vendor/bin/behat \
+        --profile=ci \
+        --suite=acceptance \
+        --no-interaction \
+        --format=progress \
+        --no-colors \
+        --stop-on-failure
+else
+    # Run with provided arguments
+    exec vendor/bin/behat \
+        --no-interaction \
+        --format=progress \
+        --no-colors \
+        --stop-on-failure \
+        "$@"
+fi
