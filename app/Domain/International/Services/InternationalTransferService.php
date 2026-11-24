@@ -74,13 +74,13 @@ final class InternationalTransferService
         private readonly InternationalScreeningService $screening,
         private readonly InternationalAuditService $audit,
         private readonly InternationalAccountService $accounts,
+        ?InternationalRailGatewayInterface $gateway = null,
     ) {
-        // No container binding exists for the gateway (no provider is
-        // registered), so the fail-closed disabled gateway is the
-        // default. A future provider adapter is injected via
-        // setGateway() — or via InternationalServiceProvider once it is
-        // registered in bootstrap/providers.php.
-        $this->gateway = new DisabledInternationalRailGateway();
+        // Resolve the registered provider binding. The registered default
+        // is DisabledInternationalRailGateway, so missing live providers
+        // remain fail-closed. Tests and future providers may inject an
+        // implementation directly without changing business logic.
+        $this->gateway = $gateway ?? app(InternationalRailGatewayInterface::class);
     }
 
     public function setGateway(InternationalRailGatewayInterface $gateway): void
